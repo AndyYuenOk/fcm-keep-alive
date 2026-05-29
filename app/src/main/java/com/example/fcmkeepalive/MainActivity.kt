@@ -15,6 +15,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -81,6 +82,8 @@ class MainActivity : ComponentActivity() {
     private var showGrantShizukuButton by mutableStateOf(true)
     private var isMenuExpanded by mutableStateOf(false)
     private var isImeDialogVisible by mutableStateOf(false)
+    private var isPowerkeeperDialogVisible by mutableStateOf(false)
+    private var powerkeeperDialogText by mutableStateOf("")
     private var imeDialogOptions by mutableStateOf<List<Pair<String, String>>>(emptyList())
     private var imeDialogSelectedIndex by mutableStateOf(0)
     private var snackbarHostState: SnackbarHostState? = null
@@ -220,6 +223,14 @@ class MainActivity : ComponentActivity() {
                                 }
                             )
                             ExtendedFloatingActionButton(
+                                text = { Text("PowerKeeper No restrictions") },
+                                icon = { Icon(Icons.Default.Settings, contentDescription = null) },
+                                onClick = {
+                                    queryPowerkeeperScenario8()
+                                    isMenuExpanded = false
+                                }
+                            )
+                            ExtendedFloatingActionButton(
                                 text = { Text("Clean FCM Whitelist") },
                                 icon = { Icon(Icons.Default.Build, contentDescription = null) },
                                 onClick = {
@@ -273,6 +284,9 @@ class MainActivity : ComponentActivity() {
         if (isImeDialogVisible) {
             ImeSelectorDialog()
         }
+        if (isPowerkeeperDialogVisible) {
+            PowerkeeperResultDialog()
+        }
     }
 
     @Composable
@@ -325,6 +339,26 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    private fun PowerkeeperResultDialog() {
+        AlertDialog(
+            onDismissRequest = { isPowerkeeperDialogVisible = false },
+            title = { Text("PowerKeeper") },
+            text = {
+                Text(
+                    text = "No restrictions\n$powerkeeperDialogText",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { isPowerkeeperDialogVisible = false }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+
+    @Composable
     private fun LogItem(entry: LogEntry) {
         val time = dateFormat.format(Date(entry.timestamp))
         val summaryLine = "${entry.event} ${entry.message}"
@@ -334,21 +368,16 @@ class MainActivity : ComponentActivity() {
             ?.filter { it.isNotBlank() }
             ?.toList()
             .orEmpty()
+        val selectableText = buildString {
+            appendLine(time)
+            appendLine(summaryLine)
+            metaLines.forEach { line -> appendLine(line) }
+        }.trimEnd()
 
         Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-            Text(
-                text = time,
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace
-            )
-            Text(
-                text = summaryLine,
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace
-            )
-            metaLines.forEach { line ->
+            SelectionContainer {
                 Text(
-                    text = line,
+                    text = selectableText,
                     style = MaterialTheme.typography.labelSmall,
                     fontFamily = FontFamily.Monospace
                 )
@@ -409,6 +438,48 @@ class MainActivity : ComponentActivity() {
             showSnackbarMessage(result.message)
             refreshLogs()
         }
+    }
+
+    private fun queryPowerkeeperScenario8() {
+        if (!Shizuku.pingBinder()) {
+            showPowerkeeperDialog("Shizuku is not running. Please start Shizuku first.")
+            return
+        }
+        if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+            showPowerkeeperDialog("Shizuku permission required")
+            return
+        }
+        lifecycleScope.launch {
+            val dialogText = withContext(Dispatchers.IO) {
+                val result = runShizukuCommand("dumpsys activity service com.miui.powerkeeper/.PowerKeeperBackgroundService")
+                if (!result.success) {
+                    return@withContext "Query failed:\n${result.error ?: "unknown error"}"
+                }
+                val matchedPackages = result.output.lineSequence()
+                    .filter { it.contains("scenario:8", ignoreCase = true) }
+                    .mapNotNull { line ->
+                        val trimmed = line.trim()
+                        val start = trimmed.indexOf("package:", ignoreCase = true)
+                        if (start < 0) return@mapNotNull null
+                        val value = trimmed.substring(start + "package:".length).trim()
+                        val pkg = value.substringBefore(" ").trim()
+                        pkg.takeIf { PACKAGE_NAME_REGEX.matches(it) }
+                    }
+                    .distinct()
+                    .toList()
+                if (matchedPackages.isEmpty()) {
+                    "No package matched: scenario:8"
+                } else {
+                    matchedPackages.joinToString(separator = "\n")
+                }
+            }
+            showPowerkeeperDialog(dialogText)
+        }
+    }
+
+    private fun showPowerkeeperDialog(text: String) {
+        powerkeeperDialogText = text.ifBlank { "(empty)" }
+        isPowerkeeperDialogVisible = true
     }
 
     private fun cleanFcmClientWhitelistInternal(): WhitelistCleanupResult {

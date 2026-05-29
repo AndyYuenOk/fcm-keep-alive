@@ -26,3 +26,7 @@ Android app for auto-switching default IME:
 ## Battery Saver
 - No restrictions `adb shell dumpsys activity service com.miui.powerkeeper | findstr "scenario:8"`
 - Apps in the list must be set to No restrictions
+
+## adb
+`adb shell settings get secure default_input_method`
+`adb shell dumpsys activity service com.google.android.gms/.gcm.GcmService | select -f 10`

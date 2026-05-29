@@ -11,11 +11,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import org.json.JSONObject
 import rikka.shizuku.Shizuku
 import java.lang.Thread.sleep
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.Locale
 import java.util.concurrent.Executors
 
 class ImeSwitchService : Service() {
@@ -132,18 +135,38 @@ class ImeSwitchService : Service() {
                     ?: targetImeId
                 val logEvent = eventType.name
                 val logMessage = "$imeName success"
-                val logMeta: String? = if (eventType == EventType.USER_PRESENT) {
-                    collectFcmDiagnosticsMeta()
+                if (eventType == EventType.USER_PRESENT) {
+                    val firstMeta = collectFirstFcmDiagnosticsMeta()
+                        ?.let { appendCountryCodeToMeta(it) }
+                    AppLogger.i(
+                        this,
+                        TAG,
+                        logEvent,
+                        logMessage,
+                        firstMeta
+                    )
+                    if (firstMeta != null && hasConnectedLine(firstMeta)) {
+                        updateNotificationSummaryFromMeta(firstMeta)
+                    }
+                    if (firstMeta != null && !hasConnectedLine(firstMeta)) {
+                        val finalDiagnosisMeta = collectFinalDisconnectedDiagnosis(firstMeta)
+                        AppLogger.i(
+                            this,
+                            TAG,
+                            "fcm_diag",
+                            "final diagnosis: ${diagnosisState(finalDiagnosisMeta)}",
+                            finalDiagnosisMeta
+                        )
+                    }
                 } else {
-                    null
+                    AppLogger.i(
+                        this,
+                        TAG,
+                        logEvent,
+                        logMessage,
+                        null
+                    )
                 }
-                AppLogger.i(
-                    this,
-                    TAG,
-                    logEvent,
-                    logMessage,
-                    logMeta
-                )
                 recordLastExecution(eventType, "success")
             } else {
                 prefs.setLastFailureReason(failureReason)
@@ -205,24 +228,13 @@ class ImeSwitchService : Service() {
         refreshNotification()
     }
 
-    private fun collectFcmDiagnosticsMeta(): String? {
+    private fun collectFirstFcmDiagnosticsMeta(): String? {
         val firstResult = runGcmDumpsys()
-        val firstMeta = firstResult.output?.let { extractFcmDiagnosticsBlock(it) }
+        return firstResult.output?.let { extractFcmDiagnosticsBlock(it) }
             ?.takeIf { it.isNotBlank() }
-        if (firstMeta == null) return null
-        if (hasConnectedLine(firstMeta)) {
-            updateNotificationSummaryFromMeta(firstMeta)
-            return firstMeta
-        }
+    }
 
-        AppLogger.i(
-            this,
-            TAG,
-            "fcm_diag",
-            "disconnect detected",
-            firstMeta
-        )
-
+    private fun collectFinalDisconnectedDiagnosis(firstMeta: String): String {
         triggerMcsHeartbeatOnce()
         var lastMeta: String? = null
         var attempt = 0
@@ -239,16 +251,14 @@ class ImeSwitchService : Service() {
                 }
             }
         }
-        val finalMeta = lastMeta ?: firstMeta
-        AppLogger.i(
-            this,
-            TAG,
-            "fcm_diag",
-            "final diagnosis",
-            finalMeta
-        )
+        val finalMeta = appendCountryCodeToMeta(lastMeta ?: firstMeta)
         updateNotificationSummaryFromMeta(finalMeta)
         return finalMeta
+    }
+
+    private fun diagnosisState(meta: String?): String {
+        if (meta.isNullOrBlank()) return "empty"
+        return if (hasConnectedLine(meta)) "connected" else "not connected"
     }
 
     private fun hasConnectedLine(meta: String): Boolean {
@@ -258,24 +268,10 @@ class ImeSwitchService : Service() {
         }
     }
 
-    private fun triggerMcsHeartbeatOnce(): HeartbeatTriggerResult {
+    private fun triggerMcsHeartbeatOnce(): Boolean {
         val command = "am broadcast -a com.google.android.intent.action.MCS_HEARTBEAT"
         val result = runShizukuCommand(command)
-        return HeartbeatTriggerResult(
-            success = !result.output.isNullOrBlank() || result.reason.isNullOrBlank(),
-            output = result.output,
-            reason = result.reason
-        )
-    }
-
-    private fun buildHeartbeatResultMeta(result: HeartbeatTriggerResult): String? {
-        val output = result.output?.trim().takeIf { !it.isNullOrBlank() }?.take(200)
-        val reason = result.reason?.trim().takeIf { !it.isNullOrBlank() }?.take(200)
-        val parts = listOfNotNull(
-            output?.let { "output=$it" },
-            reason?.let { "reason=$it" }
-        )
-        return parts.takeIf { it.isNotEmpty() }?.joinToString(", ")
+        return !result.output.isNullOrBlank() || result.reason.isNullOrBlank()
     }
 
     private fun runGcmDumpsys(): DumpsysResult {
@@ -344,10 +340,63 @@ class ImeSwitchService : Service() {
     }
 
     private fun updateNotificationSummaryFromMeta(meta: String) {
+        val countryCode = resolveCountryCodeFromMeta(meta)
         val statusLine = buildStatusLine(meta)
-        val statsLine = buildStatsLine(meta)
+        val statsLine = buildStatsLine(meta, countryCode)
         prefs.setFcmNotificationSummary(statusLine, statsLine)
+        prefs.setFcmNotificationCountryCode(countryCode)
         refreshNotification()
+    }
+
+    private fun appendCountryCodeToMeta(meta: String): String {
+        val countryCode = resolveCountryCodeFromMeta(meta) ?: return meta
+        val existingLine = meta.lineSequence().any { it.trim().startsWith("countryCode=") }
+        if (existingLine) return meta
+        return "$meta\ncountryCode=${countryCode.uppercase(Locale.ROOT)}"
+    }
+
+    private fun resolveCountryCodeFromMeta(meta: String): String? {
+        val ip = extractIpv4(meta) ?: return null
+        val cached = prefs.getIpCountryCode(ip)
+        if (!cached.isNullOrBlank()) return cached
+        val fetched = fetchCountryCodeFromApi(ip) ?: return null
+        prefs.setIpCountryCode(ip, fetched)
+        return fetched
+    }
+
+    private fun extractIpv4(raw: String): String? {
+        val ipPattern = Regex("""\b(?:\d{1,3}\.){3}\d{1,3}\b""")
+        val candidate = ipPattern.find(raw)?.value ?: return null
+        val parts = candidate.split(".")
+        if (parts.size != 4) return null
+        val valid = parts.all { part ->
+            val n = part.toIntOrNull() ?: return@all false
+            n in 0..255
+        }
+        return if (valid) candidate else null
+    }
+
+    private fun fetchCountryCodeFromApi(ip: String): String? {
+        return runCatching {
+            val url = URL("https://ip9.com.cn/get?ip=$ip")
+            val connection = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 1500
+                readTimeout = 1500
+            }
+            try {
+                val responseText = connection.inputStream.bufferedReader().use { reader -> reader.readText() }
+                val json = JSONObject(responseText)
+                if (json.optInt("ret", -1) != 200) return@runCatching null
+                val data = json.optJSONObject("data") ?: return@runCatching null
+                data.optString("country_code", "")
+                    .trim()
+                    .takeIf { it.isNotBlank() }
+                    ?.uppercase(Locale.ROOT)
+            } finally {
+                connection.disconnect()
+            }
+        }.getOrNull()
     }
 
     private fun buildStatusLine(meta: String): String {
@@ -383,7 +432,7 @@ class ImeSwitchService : Service() {
         }
     }
 
-    private fun buildStatsLine(meta: String): String {
+    private fun buildStatsLine(meta: String, countryCode: String?): String {
         val lines = meta.lineSequence().map { it.trim() }.toList()
         val connects = lines.firstOrNull { it.startsWith("streamId=") }
             ?.split(",")
@@ -399,6 +448,21 @@ class ImeSwitchService : Service() {
             ?.trim()
             ?.takeIf { it.isNotBlank() }
             ?: "-"
+        val pingInt = ping.toIntOrNull()
+        val normalizedCountryCode = countryCode
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?.uppercase(Locale.ROOT)
+        val pingSegment = when {
+            pingInt != null && normalizedCountryCode != null ->
+                "$normalizedCountryCode ${pingInt}ms"
+            pingInt != null ->
+                "- ${pingInt}ms"
+            normalizedCountryCode != null ->
+                "$normalizedCountryCode $ping"
+            else ->
+                "- $ping"
+        }
 
         val initial = lines.firstOrNull { it.startsWith("Heartbeat:") }
             ?.substringAfter("initial:", "")
@@ -406,8 +470,22 @@ class ImeSwitchService : Service() {
             ?.trim()
             ?.takeIf { it.isNotBlank() }
             ?: "-"
+        val initialMinutesText = formatInitialMinutes(initial)
 
-        return "Connects $connects Ping $ping Initial $initial"
+        return "$pingSegment Initial $initialMinutesText Connects $connects"
+    }
+
+    private fun formatInitialMinutes(initialRaw: String): String {
+        val seconds = initialRaw.removeSuffix("s").trim().toDoubleOrNull()
+            ?: return initialRaw
+        val minutes = seconds / 60.0
+        val roundedOneDecimal = kotlin.math.round(minutes * 10.0) / 10.0
+        val isWhole = kotlin.math.abs(roundedOneDecimal - roundedOneDecimal.toInt()) < 1e-9
+        return if (isWhole) {
+            "${roundedOneDecimal.toInt()}m"
+        } else {
+            String.format(Locale.US, "%.1fm", roundedOneDecimal)
+        }
     }
 
     private fun refreshNotification() {
@@ -444,12 +522,6 @@ class ImeSwitchService : Service() {
     }
 
     private data class DumpsysResult(
-        val output: String?,
-        val reason: String?
-    )
-
-    private data class HeartbeatTriggerResult(
-        val success: Boolean,
         val output: String?,
         val reason: String?
     )
