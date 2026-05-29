@@ -5,35 +5,38 @@ import android.content.SharedPreferences
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import androidx.core.content.edit
 
 class AppPrefs(context: Context) {
+    private val storageContext: Context = context.createDeviceProtectedStorageContext()
+
     private val prefs: SharedPreferences =
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        storageContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     fun getChosenImeId(): String = prefs.getString(KEY_CHOSEN_IME_ID, "") ?: ""
 
     fun setChosenImeId(imeId: String) {
-        prefs.edit().putString(KEY_CHOSEN_IME_ID, imeId).apply()
+        prefs.edit { putString(KEY_CHOSEN_IME_ID, imeId) }
     }
 
     fun getLastSwitchResult(): String = prefs.getString(KEY_LAST_SWITCH_RESULT, "Not executed") ?: "Not executed"
 
     fun setLastSwitchResult(result: String) {
-        prefs.edit().putString(KEY_LAST_SWITCH_RESULT, result).apply()
+        prefs.edit { putString(KEY_LAST_SWITCH_RESULT, result) }
     }
 
     fun getLastFailureReason(): String = prefs.getString(KEY_LAST_FAILURE_REASON, "None") ?: "None"
 
     fun setLastFailureReason(reason: String) {
-        prefs.edit().putString(KEY_LAST_FAILURE_REASON, reason).apply()
+        prefs.edit { putString(KEY_LAST_FAILURE_REASON, reason) }
     }
 
     fun setLastExecutionSnapshot(timestampMs: Long, event: String, result: String) {
-        prefs.edit()
-            .putLong(KEY_LAST_EXEC_TIME_MS, timestampMs)
-            .putString(KEY_LAST_EXEC_EVENT, event)
-            .putString(KEY_LAST_EXEC_RESULT, result)
-            .apply()
+        prefs.edit {
+            putLong(KEY_LAST_EXEC_TIME_MS, timestampMs)
+                .putString(KEY_LAST_EXEC_EVENT, event)
+                .putString(KEY_LAST_EXEC_RESULT, result)
+        }
     }
 
     fun getLastExecutionSummary(): String {

@@ -11,8 +11,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import rikka.shizuku.Shizuku
 import java.lang.Thread.sleep
@@ -31,7 +35,7 @@ class ImeSwitchService : Service() {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_OFF -> handleScreenEvent(EventType.SCREEN_OFF)
                 Intent.ACTION_USER_PRESENT -> handleScreenEvent(EventType.USER_PRESENT)
-                else -> Unit
+                else -> {}
             }
         }
     }
@@ -41,12 +45,14 @@ class ImeSwitchService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        registerReceiver(
+        ContextCompat.registerReceiver(
+            this,
             runtimeScreenReceiver,
             IntentFilter().apply {
                 addAction(Intent.ACTION_SCREEN_OFF)
                 addAction(Intent.ACTION_USER_PRESENT)
-            }
+            },
+            ContextCompat.RECEIVER_NOT_EXPORTED
         )
     }
 
@@ -56,7 +62,7 @@ class ImeSwitchService : Service() {
         when (intent?.action) {
             ACTION_START -> Unit
             null -> Unit
-            else -> Unit
+            else -> {}
         }
 
         return START_STICKY
@@ -185,7 +191,17 @@ class ImeSwitchService : Service() {
 
     private fun ensureForeground() {
         if (isForeground) return
-        startForeground(NOTIFICATION_ID, buildNotification())
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
         isForeground = true
     }
 
@@ -200,19 +216,12 @@ class ImeSwitchService : Service() {
     }
 
     private fun buildNotificationContentIntent(): PendingIntent {
-        val diagnosticsIntent = Intent().apply {
-            component = ComponentName(
-                "com.google.android.gms",
-                "com.google.android.gms.gcm.GcmDiagnostics"
+        val launchIntent = Intent(this, MainActivity::class.java).apply {
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
             )
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        val launchIntent = if (diagnosticsIntent.resolveActivity(packageManager) != null) {
-            diagnosticsIntent
-        } else {
-            Intent(this, MainActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            }
         }
         return PendingIntent.getActivity(
             this,

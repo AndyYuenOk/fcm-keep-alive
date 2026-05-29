@@ -10,14 +10,13 @@ class BootReceiver : BroadcastReceiver() {
         val action = intent?.action ?: return
 
         when (action) {
-            Intent.ACTION_BOOT_COMPLETED,
             Intent.ACTION_LOCKED_BOOT_COMPLETED -> {
                 val serviceIntent = Intent(context, ImeSwitchService::class.java).apply {
                     this.action = ImeSwitchService.ACTION_START
                 }
                 ContextCompat.startForegroundService(context, serviceIntent)
             }
-            else -> Unit
+            else -> {}
         }
     }
 }

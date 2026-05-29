@@ -5,7 +5,6 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
@@ -44,10 +43,8 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -122,11 +119,7 @@ class MainActivity : ComponentActivity() {
         val isDarkTheme = isSystemInDarkTheme()
         val context = LocalContext.current
         val view = LocalView.current
-        val colorScheme = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (isDarkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        } else {
-            if (isDarkTheme) darkColorScheme() else lightColorScheme()
-        }
+        val colorScheme = if (isDarkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
         if (!view.isInEditMode) {
             SideEffect {
                 this@MainActivity.enableEdgeToEdge(
@@ -782,7 +775,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestNotificationPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
         ) {
