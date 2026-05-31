@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:tools="http://schemas.android.com/tools"
     xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -20,6 +20,7 @@
 
     <application
         android:label="FCM Keep Alive"
+        android:defaultToDeviceProtectedStorage="true"
         android:supportsRtl="true"
         android:theme="@style/Theme.Material3.DayNight.NoActionBar"
         tools:ignore="MissingApplicationIcon">
@@ -51,12 +52,12 @@
 
         <receiver
             android:name=".BootReceiver"
-            android:exported="true"
-            android:directBootAware="true">
+            android:exported="true">
             <intent-filter>
-                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
     </application>
 
 </manifest>
+

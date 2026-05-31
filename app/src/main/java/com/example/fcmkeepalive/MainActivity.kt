@@ -264,7 +264,7 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding)
-                    .padding(12.dp)
+                    .padding(horizontal = 12.dp)
             ) {
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
                     items(logs) { entry ->
@@ -416,14 +416,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun cleanFcmClientWhitelist() {
-        if (!Shizuku.pingBinder()) {
-            showSnackbarMessage("Shizuku is not running. Please start Shizuku first.")
-            return
-        }
-        if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-            showSnackbarMessage("Shizuku permission required")
-            return
-        }
+        if (!ensureShizukuReadyForCommand(::showSnackbarMessage)) return
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
                 cleanFcmClientWhitelistInternal()
@@ -434,14 +427,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun queryPowerkeeperScenario8() {
-        if (!Shizuku.pingBinder()) {
-            showPowerkeeperDialog("Shizuku is not running. Please start Shizuku first.")
-            return
-        }
-        if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-            showPowerkeeperDialog("Shizuku permission required")
-            return
-        }
+        if (!ensureShizukuReadyForCommand(::showPowerkeeperDialog)) return
         lifecycleScope.launch {
             val dialogText = withContext(Dispatchers.IO) {
                 val result = runShizukuCommand("dumpsys activity service com.miui.powerkeeper/.PowerKeeperBackgroundService")
@@ -468,6 +454,18 @@ class MainActivity : ComponentActivity() {
             }
             showPowerkeeperDialog(dialogText)
         }
+    }
+
+    private fun ensureShizukuReadyForCommand(onFail: (String) -> Unit): Boolean {
+        if (!Shizuku.pingBinder()) {
+            onFail("Shizuku is not running. Please start Shizuku first.")
+            return false
+        }
+        if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+            onFail("Shizuku permission required")
+            return false
+        }
+        return true
     }
 
     private fun showPowerkeeperDialog(text: String) {
@@ -687,6 +685,16 @@ class MainActivity : ComponentActivity() {
 
     private fun runShizukuCommand(command: String): CommandResult {
         return try {
+            if (!Shizuku.pingBinder()) {
+                val reason = "Shizuku not running"
+                AppLogger.w(this, "MainActivity", "shizuku_cmd", reason, "command=$command")
+                return CommandResult(success = false, output = "", error = reason)
+            }
+            if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                val reason = "Shizuku permission denied"
+                AppLogger.w(this, "MainActivity", "shizuku_cmd", reason, "command=$command")
+                return CommandResult(success = false, output = "", error = reason)
+            }
             val newProcessMethod = Shizuku::class.java.getDeclaredMethod(
                 "newProcess",
                 Array<String>::class.java,
@@ -704,12 +712,38 @@ class MainActivity : ComponentActivity() {
             val error = process.errorStream?.bufferedReader()?.readText().orEmpty()
             val code = process.waitFor()
             val success = code == 0
+            if (!success) {
+                val reason = error.ifBlank { "exit code $code" }
+                AppLogger.w(
+                    this,
+                    "MainActivity",
+                    "shizuku_cmd",
+                    "Command failed",
+                    "command=$command, exit=$code, error=${reason.take(300)}"
+                )
+            } else if (output.isBlank() && error.isBlank()) {
+                AppLogger.w(
+                    this,
+                    "MainActivity",
+                    "shizuku_cmd",
+                    "Command succeeded but no output",
+                    "command=$command"
+                )
+            }
             CommandResult(
                 success = success,
                 output = output,
                 error = if (success) null else error.ifBlank { "exit code $code" }
             )
         } catch (t: Throwable) {
+            AppLogger.e(
+                this,
+                "MainActivity",
+                "shizuku_cmd",
+                "Command exception",
+                t,
+                "command=$command"
+            )
             CommandResult(success = false, output = "", error = t.message ?: t.javaClass.simpleName)
         }
     }

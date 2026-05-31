@@ -6,13 +6,11 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -32,10 +30,11 @@ class ImeSwitchService : Service() {
 
     private val runtimeScreenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                Intent.ACTION_SCREEN_OFF -> handleScreenEvent(EventType.SCREEN_OFF)
-                Intent.ACTION_USER_PRESENT -> handleScreenEvent(EventType.USER_PRESENT)
-                else -> {}
+            val action = intent?.action ?: return
+            if (action == Intent.ACTION_SCREEN_OFF) {
+                handleScreenEvent(EventType.SCREEN_OFF)
+            } else if (action == Intent.ACTION_USER_PRESENT) {
+                handleScreenEvent(EventType.USER_PRESENT)
             }
         }
     }
@@ -58,29 +57,15 @@ class ImeSwitchService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         ensureForeground()
-
-        when (intent?.action) {
-            ACTION_START -> Unit
-            null -> Unit
-            else -> {}
-        }
-
         return START_STICKY
     }
 
     private fun handleScreenEvent(eventType: EventType) {
         if (!ImeHelper.hasWriteSecureSettings(this)) {
-            val reason = "WRITE_SECURE_SETTINGS is not granted, cannot auto switch"
-            prefs.setLastFailureReason(reason)
-            prefs.setLastSwitchResult("${eventType.name} switch failed")
-            AppLogger.w(
-                this,
-                TAG,
-                "switch_result",
-                "${eventType.name} switch failed: $reason",
-                "event=${eventType.name}"
+            handleSwitchFailure(
+                eventType = eventType,
+                reason = "WRITE_SECURE_SETTINGS is not granted, cannot auto switch"
             )
-            recordLastExecution(eventType, "failed")
             return
         }
 
@@ -90,21 +75,14 @@ class ImeSwitchService : Service() {
         }
 
         if (targetImeId.isEmpty()) {
-            val reason = if (eventType == EventType.USER_PRESENT) {
-                "IME ID is not configured"
-            } else {
-                "Gboard ID is empty"
-            }
-            prefs.setLastFailureReason(reason)
-            prefs.setLastSwitchResult("${eventType.name} switch failed")
-            AppLogger.w(
-                this,
-                TAG,
-                "switch_result",
-                "${eventType.name} switch failed: $reason",
-                "event=${eventType.name}"
+            handleSwitchFailure(
+                eventType = eventType,
+                reason = if (eventType == EventType.USER_PRESENT) {
+                    "IME ID is not configured"
+                } else {
+                    "Gboard ID is empty"
+                }
             )
-            recordLastExecution(eventType, "failed")
             return
         }
 
@@ -118,17 +96,11 @@ class ImeSwitchService : Service() {
             try {
                 success = ImeHelper.setDefaultIme(this, targetImeId)
             } catch (t: Throwable) {
-                failureReason = "Switch exception: ${t.message ?: t.javaClass.simpleName}"
-                prefs.setLastFailureReason(failureReason)
-                prefs.setLastSwitchResult("${eventType.name} switch failed")
-                AppLogger.w(
-                    this,
-                    TAG,
-                    "switch_result",
-                    "${eventType.name} switch failed: $failureReason",
-                    "event=${eventType.name}, imeId=$targetImeId"
+                handleSwitchFailure(
+                    eventType = eventType,
+                    reason = "Switch exception: ${t.message ?: t.javaClass.simpleName}",
+                    targetImeId = targetImeId
                 )
-                recordLastExecution(eventType, "failed")
                 return@execute
             }
 
@@ -142,66 +114,57 @@ class ImeSwitchService : Service() {
                 val logEvent = eventType.name
                 val logMessage = "$imeName success"
                 if (eventType == EventType.USER_PRESENT) {
+                    updateNotificationSummary(FCM_PLACEHOLDER_META, countryCode = null, latencyMs = null)
                     val firstMeta = collectFirstFcmDiagnosticsMeta()
-                        ?.let { appendCountryCodeToMeta(it) }
-                    AppLogger.i(
-                        this,
-                        TAG,
-                        logEvent,
-                        logMessage,
+                    val userPresentMeta = if (firstMeta == null) {
+                        FCM_PLACEHOLDER_META
+                    } else if (hasConnectedLine(firstMeta)) {
                         firstMeta
-                    )
-                    if (firstMeta != null && hasConnectedLine(firstMeta)) {
-                        updateNotificationSummaryFromMeta(firstMeta)
+                    } else {
+                        collectFinalDisconnectedDiagnosis(firstMeta)
                     }
-                    if (firstMeta != null && !hasConnectedLine(firstMeta)) {
-                        val finalDiagnosisMeta = collectFinalDisconnectedDiagnosis(firstMeta)
-                        AppLogger.i(
-                            this,
-                            TAG,
-                            "fcm_diag",
-                            "final diagnosis: ${diagnosisState(finalDiagnosisMeta)}",
-                            finalDiagnosisMeta
-                        )
-                    }
+                    AppLogger.i(this, TAG, logEvent, logMessage, userPresentMeta)
+                    resolveMetricsAsyncAndRefresh(userPresentMeta)
                 } else {
-                    AppLogger.i(
-                        this,
-                        TAG,
-                        logEvent,
-                        logMessage,
-                        null
-                    )
+                    AppLogger.i(this, TAG, logEvent, logMessage, null)
                 }
                 recordLastExecution(eventType, "success")
             } else {
-                prefs.setLastFailureReason(failureReason)
-                prefs.setLastSwitchResult("${eventType.name} switch failed")
-                AppLogger.w(
-                    this,
-                    TAG,
-                    "switch_result",
-                    "${eventType.name} switch failed: $failureReason",
-                    "event=${eventType.name}, imeId=$targetImeId"
+                handleSwitchFailure(
+                    eventType = eventType,
+                    reason = failureReason,
+                    targetImeId = targetImeId
                 )
-                recordLastExecution(eventType, "failed")
             }
         }
+    }
+
+    private fun handleSwitchFailure(eventType: EventType, reason: String, targetImeId: String? = null) {
+        prefs.setLastFailureReason(reason)
+        prefs.setLastSwitchResult("${eventType.name} switch failed")
+        val meta = buildString {
+            append("event=${eventType.name}")
+            if (!targetImeId.isNullOrBlank()) append(", imeId=$targetImeId")
+        }
+        AppLogger.w(
+            this,
+            TAG,
+            "switch_result",
+            "${eventType.name} switch failed: $reason",
+            meta
+        )
+        recordLastExecution(eventType, "failed")
     }
 
     private fun ensureForeground() {
         if (isForeground) return
         val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ServiceCompat.startForeground(
-                this,
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
+        ServiceCompat.startForeground(
+            this,
+            NOTIFICATION_ID,
+            notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        )
         isForeground = true
     }
 
@@ -260,14 +223,7 @@ class ImeSwitchService : Service() {
                 }
             }
         }
-        val finalMeta = appendCountryCodeToMeta(lastMeta ?: firstMeta)
-        updateNotificationSummaryFromMeta(finalMeta)
-        return finalMeta
-    }
-
-    private fun diagnosisState(meta: String?): String {
-        if (meta.isNullOrBlank()) return "empty"
-        return if (hasConnectedLine(meta)) "connected" else "not connected"
+        return lastMeta ?: firstMeta
     }
 
     private fun hasConnectedLine(meta: String): Boolean {
@@ -285,16 +241,27 @@ class ImeSwitchService : Service() {
 
     private fun runGcmDumpsys(): DumpsysResult {
         if (!Shizuku.pingBinder()) {
-            return DumpsysResult(output = null, reason = "Shizuku not running")
+            val reason = "Shizuku not running"
+            AppLogger.w(this, TAG, "shizuku_cmd", reason, "command=gcm_dumpsys")
+            return DumpsysResult(output = null, reason = reason)
         }
         if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-            return DumpsysResult(output = null, reason = "Shizuku permission denied")
+            val reason = "Shizuku permission denied"
+            AppLogger.w(this, TAG, "shizuku_cmd", reason, "command=gcm_dumpsys")
+            return DumpsysResult(output = null, reason = reason)
         }
         val command = "dumpsys activity service com.google.android.gms/.gcm.GcmService"
         val commandResult = runShizukuCommand(command)
         if (!commandResult.output.isNullOrBlank()) {
             return commandResult
         }
+        AppLogger.w(
+            this,
+            TAG,
+            "shizuku_cmd",
+            "Command returned no output",
+            "command=$command, reason=${commandResult.reason ?: "empty"}"
+        )
         return DumpsysResult(
             output = null,
             reason = commandResult.reason ?: "No output from dumpsys command"
@@ -320,14 +287,39 @@ class ImeSwitchService : Service() {
             val output = process.inputStream?.bufferedReader()?.readText().orEmpty()
             val error = process.errorStream?.bufferedReader()?.readText().orEmpty()
             if (exitCode != 0) {
+                val reason = if (error.isNotBlank()) error.trim() else "Non-zero exit ($exitCode): $command"
+                AppLogger.w(
+                    this,
+                    TAG,
+                    "shizuku_cmd",
+                    "Command failed",
+                    "command=$command, exit=$exitCode, error=${reason.take(300)}"
+                )
                 return DumpsysResult(
                     output = null,
-                    reason = if (error.isNotBlank()) error.trim() else "Non-zero exit ($exitCode): $command"
+                    reason = reason
                 )
             }
             val merged = output.ifBlank { error }.takeIf { it.isNotBlank() }
+            if (merged.isNullOrBlank()) {
+                AppLogger.w(
+                    this,
+                    TAG,
+                    "shizuku_cmd",
+                    "Command succeeded but no output",
+                    "command=$command"
+                )
+            }
             DumpsysResult(output = merged, reason = null)
         }.getOrElse {
+            AppLogger.e(
+                this,
+                TAG,
+                "shizuku_cmd",
+                "Command exception",
+                it,
+                "command=$command"
+            )
             DumpsysResult(output = null, reason = "Command exception: ${it.message}")
         }
     }
@@ -348,63 +340,80 @@ class ImeSwitchService : Service() {
         return collected.joinToString(separator = "\n")
     }
 
-    private fun updateNotificationSummaryFromMeta(meta: String) {
-        val countryCode = resolveCountryCodeFromMeta(meta)
+    private fun updateNotificationSummary(meta: String, countryCode: String?, latencyMs: Int?) {
         val statusLine = buildStatusLine(meta)
-        val statsLine = buildStatsLine(meta, countryCode)
+        val statsLine = buildStatsLine(meta, countryCode, latencyMs)
         prefs.setFcmNotificationSummary(statusLine, statsLine)
         prefs.setFcmNotificationCountryCode(countryCode)
         refreshNotification()
     }
 
-    private fun appendCountryCodeToMeta(meta: String): String {
-        val countryCode = resolveCountryCodeFromMeta(meta) ?: return meta
-        val existingLine = meta.lineSequence().any { it.trim().startsWith("countryCode=") }
-        if (existingLine) return meta
-        return "$meta\ncountryCode=${countryCode.uppercase(Locale.ROOT)}"
-    }
-
-    private fun resolveCountryCodeFromMeta(meta: String): String? {
-        val ip = extractIpv4(meta) ?: return null
-        val cached = prefs.getIpCountryCode(ip)
-        if (!cached.isNullOrBlank()) return cached
-        val fetched = fetchCountryCodeFromApi(ip) ?: return null
-        prefs.setIpCountryCode(ip, fetched)
-        return fetched
-    }
-
-    private fun extractIpv4(raw: String): String? {
-        val ipPattern = Regex("""\b(?:\d{1,3}\.){3}\d{1,3}\b""")
-        val candidate = ipPattern.find(raw)?.value ?: return null
-        val parts = candidate.split(".")
-        if (parts.size != 4) return null
-        val valid = parts.all { part ->
-            val n = part.toIntOrNull() ?: return@all false
-            n in 0..255
+    private fun resolveMetricsAsyncAndRefresh(meta: String) {
+        ioExecutor.execute {
+            val countryCode = fetchCountryCodeFromApi()
+            val latencyTargetUrl = extractFcmDomainUrl(meta)
+            val latencyMs = latencyTargetUrl?.let { measureHttpLatencyMs(it) }
+            val metricsMeta = buildMetricsMeta(
+                countryCode = countryCode ?: PLACEHOLDER_METRIC,
+                latencyText = latencyMs?.let { "${it}ms" } ?: PLACEHOLDER_METRIC
+            )
+            AppLogger.i(this, TAG, "fcm_metric", "country_latency", metricsMeta)
+            updateNotificationSummary(meta, countryCode, latencyMs)
         }
-        return if (valid) candidate else null
     }
 
-    private fun fetchCountryCodeFromApi(ip: String): String? {
+    private fun extractFcmDomainUrl(meta: String): String? {
+        val domain = FCM_DOMAIN_REGEX.find(meta)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        if (domain.isBlank()) return null
+        return "https://${domain.lowercase(Locale.ROOT)}"
+    }
+
+    private fun buildMetricsMeta(countryCode: String, latencyText: String): String {
+        return buildString {
+            appendLine("countryCode=$countryCode")
+            append("latency=$latencyText")
+        }
+    }
+
+    private fun fetchCountryCodeFromApi(): String? {
         return runCatching {
-            val url = URL("https://ip9.com.cn/get?ip=$ip")
-            val connection = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 1500
-                readTimeout = 1500
-            }
+            val url = URL("https://ipinfo.io/json")
+            val connection = url.openConnection() as HttpURLConnection
+            connection.connectTimeout = API_TIMEOUT_MS
+            connection.readTimeout = API_TIMEOUT_MS
             try {
                 val responseText = connection.inputStream.bufferedReader().use { reader -> reader.readText() }
                 val json = JSONObject(responseText)
-                if (json.optInt("ret", -1) != 200) return@runCatching null
-                val data = json.optJSONObject("data") ?: return@runCatching null
-                data.optString("country_code", "")
+                json.getString("country")
                     .trim()
-                    .takeIf { it.isNotBlank() }
-                    ?.uppercase(Locale.ROOT)
+                    .uppercase(Locale.ROOT)
             } finally {
                 connection.disconnect()
             }
+        }.getOrNull()
+    }
+
+    private fun measureHttpLatencyMs(urlText: String): Int? {
+        return runCatching {
+            val connection = URL(urlText).openConnection() as HttpURLConnection
+            connection.requestMethod = "GET"
+            connection.instanceFollowRedirects = false
+            try {
+                val startNs = System.nanoTime()
+                connection.connect()
+                val elapsedMs = (System.nanoTime() - startNs) / 1_000_000.0
+                elapsedMs.toInt().coerceAtLeast(1)
+            } finally {
+                connection.disconnect()
+            }
+        }.onFailure {
+            AppLogger.w(
+                this,
+                TAG,
+                "fcm_metric",
+                "Latency probe failed",
+                "url=$urlText, error=${it.message ?: it.javaClass.simpleName}"
+            )
         }.getOrNull()
     }
 
@@ -441,7 +450,7 @@ class ImeSwitchService : Service() {
         }
     }
 
-    private fun buildStatsLine(meta: String, countryCode: String?): String {
+    private fun buildStatsLine(meta: String, countryCode: String?, latencyMs: Int?): String {
         val lines = meta.lineSequence().map { it.trim() }.toList()
         val connects = lines.firstOrNull { it.startsWith("streamId=") }
             ?.split(",")
@@ -452,26 +461,13 @@ class ImeSwitchService : Service() {
             ?.takeIf { it.isNotBlank() }
             ?: "-"
 
-        val ping = lines.firstOrNull { it.startsWith("Last ping:") }
-            ?.substringAfter("Last ping:")
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?: "-"
-        val pingInt = ping.toIntOrNull()
         val normalizedCountryCode = countryCode
             ?.trim()
             ?.takeIf { it.isNotBlank() }
             ?.uppercase(Locale.ROOT)
-        val pingSegment = when {
-            pingInt != null && normalizedCountryCode != null ->
-                "$normalizedCountryCode ${pingInt}ms"
-            pingInt != null ->
-                "- ${pingInt}ms"
-            normalizedCountryCode != null ->
-                "$normalizedCountryCode $ping"
-            else ->
-                "- $ping"
-        }
+        val latencyText = latencyMs?.let { "${it}ms" } ?: "-"
+        val countryText = normalizedCountryCode ?: "-"
+        val pingSegment = "$countryText $latencyText"
 
         val initial = lines.firstOrNull { it.startsWith("Heartbeat:") }
             ?.substringAfter("initial:", "")
@@ -526,6 +522,13 @@ class ImeSwitchService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val RECHECK_DELAY_MS = 30_000L
         private const val RECHECK_MAX_ATTEMPTS = 3
+        private const val API_TIMEOUT_MS = 5_000
+        private const val PLACEHOLDER_METRIC = "-"
+        private const val FCM_PLACEHOLDER_META = "diagnosis=pending"
+        private val FCM_DOMAIN_REGEX = Regex(
+            """\b((?:mtalk|fcm|gcm)[a-zA-Z0-9.-]*\.google\.com(?::\d{2,5})?)\b""",
+            RegexOption.IGNORE_CASE
+        )
 
         const val ACTION_START = "com.example.fcmkeepalive.action.START"
     }
