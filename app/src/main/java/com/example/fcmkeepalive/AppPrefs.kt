@@ -82,6 +82,12 @@ class AppPrefs(context: Context) {
         prefs.edit { putString(KEY_LOG_ENTRIES_JSON, json) }
     }
 
+    fun getCountryCodeCacheJson(): String = prefs.getString(KEY_COUNTRY_CODE_CACHE_JSON, "[]") ?: "[]"
+
+    fun setCountryCodeCacheJson(json: String) {
+        prefs.edit { putString(KEY_COUNTRY_CODE_CACHE_JSON, json) }
+    }
+
     fun registerChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) {
         prefs.registerOnSharedPreferenceChangeListener(listener)
     }
@@ -102,5 +108,6 @@ class AppPrefs(context: Context) {
         private const val KEY_FCM_NOTIFY_STATUS_LINE = "fcm_notify_status_line"
         private const val KEY_FCM_NOTIFY_STATS_LINE = "fcm_notify_stats_line"
         private const val KEY_FCM_NOTIFY_COUNTRY_CODE = "fcm_notify_country_code"
+        private const val KEY_COUNTRY_CODE_CACHE_JSON = "country_code_cache_json"
     }
 }

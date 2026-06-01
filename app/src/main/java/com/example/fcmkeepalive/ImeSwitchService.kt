@@ -15,18 +15,22 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import org.json.JSONArray
 import org.json.JSONObject
 import rikka.shizuku.Shizuku
 import java.lang.Thread.sleep
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.ArrayList
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Executors
 
 class ImeSwitchService : Service() {
     private val prefs by lazy { AppPrefs(this) }
     private val notificationManager by lazy { getSystemService(NotificationManager::class.java) }
     private val ioExecutor = Executors.newSingleThreadExecutor()
+    private val isBroadcastTaskRunning = AtomicBoolean(false)
 
     private val runtimeScreenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -61,6 +65,32 @@ class ImeSwitchService : Service() {
     }
 
     private fun handleScreenEvent(eventType: EventType) {
+        if (!isBroadcastTaskRunning.compareAndSet(false, true)) {
+            logTaskDropped(eventType, "task already running")
+            return
+        }
+        try {
+            ioExecutor.execute {
+                try {
+                    runScreenEventTask(eventType)
+                } finally {
+                    isBroadcastTaskRunning.set(false)
+                }
+            }
+        } catch (t: Throwable) {
+            isBroadcastTaskRunning.set(false)
+            AppLogger.e(
+                this,
+                TAG,
+                "switch_task",
+                "Failed to submit task",
+                t,
+                "event=${eventType.name}"
+            )
+        }
+    }
+
+    private fun runScreenEventTask(eventType: EventType) {
         if (!ImeHelper.hasWriteSecureSettings(this)) {
             handleSwitchFailure(
                 eventType = eventType,
@@ -86,57 +116,62 @@ class ImeSwitchService : Service() {
             return
         }
 
-        switchOnce(eventType, targetImeId)
+        val success: Boolean
+        var failureReason = "Failed to write DEFAULT_INPUT_METHOD"
+        try {
+            success = ImeHelper.setDefaultIme(this, targetImeId)
+        } catch (t: Throwable) {
+            handleSwitchFailure(
+                eventType = eventType,
+                reason = "Switch exception: ${t.message ?: t.javaClass.simpleName}",
+                targetImeId = targetImeId
+            )
+            return
+        }
+
+        if (success) {
+            prefs.setLastFailureReason("None")
+            prefs.setLastSwitchResult("${eventType.name} switch success -> $targetImeId")
+            val imeName = ImeHelper.resolveImeDisplayName(this, targetImeId)
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: targetImeId
+            val logEvent = eventType.name
+            val logMessage = "$imeName success"
+            if (eventType == EventType.USER_PRESENT) {
+                updateNotificationSummary(FCM_PLACEHOLDER_META, countryCode = null, latencyMs = null)
+                val firstMeta = collectFirstFcmDiagnosticsMeta()
+                val firstMetaOrPlaceholder = firstMeta ?: FCM_PLACEHOLDER_META
+                AppLogger.i(this, TAG, logEvent, logMessage, firstMetaOrPlaceholder)
+
+                var metricsMetaSource = firstMetaOrPlaceholder
+                if (firstMeta != null && !hasConnectedLine(firstMeta)) {
+                    val finalMeta = collectFinalDisconnectedDiagnosis(firstMeta)
+                    AppLogger.i(this, TAG, "", "final diagnosis", finalMeta)
+                    metricsMetaSource = finalMeta
+                }
+                resolveMetricsAsyncAndRefresh(metricsMetaSource)
+            } else {
+                AppLogger.i(this, TAG, logEvent, logMessage, null)
+            }
+            recordLastExecution(eventType, "success")
+        } else {
+            handleSwitchFailure(
+                eventType = eventType,
+                reason = failureReason,
+                targetImeId = targetImeId
+            )
+        }
     }
 
-    private fun switchOnce(eventType: EventType, targetImeId: String) {
-        ioExecutor.execute {
-            val success: Boolean
-            var failureReason = "Failed to write DEFAULT_INPUT_METHOD"
-            try {
-                success = ImeHelper.setDefaultIme(this, targetImeId)
-            } catch (t: Throwable) {
-                handleSwitchFailure(
-                    eventType = eventType,
-                    reason = "Switch exception: ${t.message ?: t.javaClass.simpleName}",
-                    targetImeId = targetImeId
-                )
-                return@execute
-            }
-
-            if (success) {
-                prefs.setLastFailureReason("None")
-                prefs.setLastSwitchResult("${eventType.name} switch success -> $targetImeId")
-                val imeName = ImeHelper.resolveImeDisplayName(this, targetImeId)
-                    ?.trim()
-                    ?.takeIf { it.isNotBlank() }
-                    ?: targetImeId
-                val logEvent = eventType.name
-                val logMessage = "$imeName success"
-                if (eventType == EventType.USER_PRESENT) {
-                    updateNotificationSummary(FCM_PLACEHOLDER_META, countryCode = null, latencyMs = null)
-                    val firstMeta = collectFirstFcmDiagnosticsMeta()
-                    val userPresentMeta = if (firstMeta == null) {
-                        FCM_PLACEHOLDER_META
-                    } else if (hasConnectedLine(firstMeta)) {
-                        firstMeta
-                    } else {
-                        collectFinalDisconnectedDiagnosis(firstMeta)
-                    }
-                    AppLogger.i(this, TAG, logEvent, logMessage, userPresentMeta)
-                    resolveMetricsAsyncAndRefresh(userPresentMeta)
-                } else {
-                    AppLogger.i(this, TAG, logEvent, logMessage, null)
-                }
-                recordLastExecution(eventType, "success")
-            } else {
-                handleSwitchFailure(
-                    eventType = eventType,
-                    reason = failureReason,
-                    targetImeId = targetImeId
-                )
-            }
-        }
+    private fun logTaskDropped(eventType: EventType, reason: String) {
+        AppLogger.w(
+            this,
+            TAG,
+            "switch_task",
+            "${eventType.name} dropped: $reason",
+            "event=${eventType.name}, reason=$reason"
+        )
     }
 
     private fun handleSwitchFailure(eventType: EventType, reason: String, targetImeId: String? = null) {
@@ -349,60 +384,127 @@ class ImeSwitchService : Service() {
     }
 
     private fun resolveMetricsAsyncAndRefresh(meta: String) {
-        ioExecutor.execute {
-            val countryCode = fetchCountryCodeFromApi()
-            val latencyTargetUrl = extractFcmDomainUrl(meta)
-            val latencyMs = latencyTargetUrl?.let { measureHttpLatencyMs(it) }
-            val metricsMeta = buildMetricsMeta(
-                countryCode = countryCode ?: PLACEHOLDER_METRIC,
-                latencyText = latencyMs?.let { "${it}ms" } ?: PLACEHOLDER_METRIC
+        val connectedIp = parseConnectedIpFromMeta(meta)
+        var cacheState = "skip"
+        val countryCode = if (connectedIp == null) {
+            AppLogger.w(this, TAG, "fcm_metric", "Country lookup failed", "reason=ip_not_found_in_meta")
+            null
+        } else if (!isValidPublicIpv4(connectedIp)) {
+            AppLogger.w(
+                this,
+                TAG,
+                "fcm_metric",
+                "Country lookup failed",
+                "reason=ip_not_public, ip=$connectedIp"
             )
-            AppLogger.i(this, TAG, "fcm_metric", "country_latency", metricsMeta)
-            updateNotificationSummary(meta, countryCode, latencyMs)
+            null
+        } else {
+            val cacheLookup = getCountryCodeFromCache(connectedIp)
+            cacheState = cacheLookup.state
+            val cachedCountry = cacheLookup.countryCode
+            if (cachedCountry != null) {
+                cachedCountry
+            } else {
+                fetchCountryCodeByIp(connectedIp)?.also { fetchedCountry ->
+                    saveCountryCodeToCache(connectedIp, fetchedCountry)
+                    cacheState = if (cacheState == "expired") {
+                        "expired,store"
+                    } else {
+                        "miss,store"
+                    }
+                }
+            }
         }
+        val latencyMs = parseLastPingMs(meta)
+        val metricsMeta = buildMetricsMeta(
+            countryCode = countryCode ?: PLACEHOLDER_METRIC,
+            ip = connectedIp,
+            cache = cacheState
+        )
+        AppLogger.i(this, TAG, "fcm_metric", "country_latency", metricsMeta)
+        updateNotificationSummary(meta, countryCode, latencyMs)
     }
 
-    private fun extractFcmDomainUrl(meta: String): String? {
-        val domain = FCM_DOMAIN_REGEX.find(meta)?.groupValues?.getOrNull(1)?.trim().orEmpty()
-        if (domain.isBlank()) return null
-        return "https://${domain.lowercase(Locale.ROOT)}"
+    private fun parseLastPingMs(meta: String): Int? {
+        val line = meta.lineSequence()
+            .map { it.trim() }
+            .firstOrNull {
+                it.startsWith("Last ping:", ignoreCase = true) ||
+                    it.startsWith("Last ping=", ignoreCase = true)
+            }
+            ?: return null
+        val raw = line.substringAfter(":")
+            .substringAfter("=")
+            .trim()
+            .takeIf { it.isNotEmpty() }
+            ?: return null
+        return raw.toIntOrNull()?.takeIf { it >= 0 }
     }
 
-    private fun buildMetricsMeta(countryCode: String, latencyText: String): String {
+    private fun buildMetricsMeta(countryCode: String, ip: String?, cache: String): String {
         return buildString {
             appendLine("countryCode=$countryCode")
-            append("latency=$latencyText")
+            appendLine("ip=${ip?.ifBlank { PLACEHOLDER_METRIC } ?: PLACEHOLDER_METRIC}")
+            append("cache=$cache")
         }
     }
 
-    private fun fetchCountryCodeFromApi(): String? {
+    private fun parseConnectedIpFromMeta(meta: String): String? {
+        val connectedLine = meta.lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("connected=", ignoreCase = true) }
+            ?: return null
+        val endpoint = connectedLine.substringAfter("connected=", "")
+            .substringBefore(",")
+            .trim()
+            .takeIf { it.isNotEmpty() }
+            ?: return null
+        val ipCandidate = endpoint.substringAfterLast("/")
+            .trim()
+            .takeIf { it.isNotEmpty() }
+            ?: return null
+        return ipCandidate.takeIf { isValidIpv4(it) }
+    }
+
+    private fun isValidIpv4(ip: String): Boolean {
+        val segments = ip.split(".")
+        if (segments.size != 4) return false
+        for (segment in segments) {
+            val n = segment.toIntOrNull() ?: return false
+            if (n !in 0..255) return false
+        }
+        return true
+    }
+
+    private fun isValidPublicIpv4(ip: String): Boolean {
+        if (!isValidIpv4(ip)) return false
+        val segments = ip.split(".")
+        val nums = IntArray(4)
+        for (i in 0..3) {
+            nums[i] = segments[i].toInt()
+        }
+        if (nums[0] == 198 && nums[1] in 18..19) return false
+        if (nums[0] == 10) return false
+        if (nums[0] == 172 && nums[1] in 16..31) return false
+        if (nums[0] == 192 && nums[1] == 168) return false
+        if (nums[0] == 127) return false
+        if (nums[0] == 0) return false
+        if (nums[0] >= 224) return false
+        return true
+    }
+
+    private fun fetchCountryCodeByIp(ip: String): String? {
         return runCatching {
-            val url = URL("https://ipinfo.io/json")
+            val url = URL("https://ipinfo.io/$ip/json")
             val connection = url.openConnection() as HttpURLConnection
             connection.connectTimeout = API_TIMEOUT_MS
             connection.readTimeout = API_TIMEOUT_MS
             try {
                 val responseText = connection.inputStream.bufferedReader().use { reader -> reader.readText() }
-                val json = JSONObject(responseText)
-                json.getString("country")
+                JSONObject(responseText)
+                    .getString("country")
                     .trim()
                     .uppercase(Locale.ROOT)
-            } finally {
-                connection.disconnect()
-            }
-        }.getOrNull()
-    }
-
-    private fun measureHttpLatencyMs(urlText: String): Int? {
-        return runCatching {
-            val connection = URL(urlText).openConnection() as HttpURLConnection
-            connection.requestMethod = "GET"
-            connection.instanceFollowRedirects = false
-            try {
-                val startNs = System.nanoTime()
-                connection.connect()
-                val elapsedMs = (System.nanoTime() - startNs) / 1_000_000.0
-                elapsedMs.toInt().coerceAtLeast(1)
             } finally {
                 connection.disconnect()
             }
@@ -411,10 +513,110 @@ class ImeSwitchService : Service() {
                 this,
                 TAG,
                 "fcm_metric",
-                "Latency probe failed",
-                "url=$urlText, error=${it.message ?: it.javaClass.simpleName}"
+                "Country lookup by ip failed",
+                "ip=$ip, error=${it.message ?: it.javaClass.simpleName}"
             )
         }.getOrNull()
+    }
+
+    private fun getCountryCodeFromCache(ip: String): CountryCacheLookup {
+        val now = System.currentTimeMillis()
+        val cacheItems = loadCountryCacheItems()
+        var foundCountry: String? = null
+        var expired = false
+        val refreshed = ArrayList<CountryCodeCacheItem>(cacheItems.size)
+        for (item in cacheItems) {
+            if (now - item.updatedAtMs > COUNTRY_CACHE_TTL_MS) {
+                if (item.ip == ip) {
+                    expired = true
+                }
+                continue
+            }
+            if (item.ip == ip) {
+                foundCountry = item.countryCode
+            } else {
+                refreshed.add(item)
+            }
+        }
+        if (foundCountry != null) {
+            refreshed.add(CountryCodeCacheItem(ip = ip, countryCode = foundCountry, updatedAtMs = now))
+        }
+        val pruned = pruneCountryCache(refreshed)
+        if (pruned != cacheItems) {
+            persistCountryCacheItems(pruned)
+        }
+        val state = when {
+            foundCountry != null -> "hit"
+            expired -> "expired"
+            else -> "miss"
+        }
+        return CountryCacheLookup(countryCode = foundCountry, state = state)
+    }
+
+    private fun saveCountryCodeToCache(ip: String, countryCode: String) {
+        if (countryCode.isBlank()) return
+        val now = System.currentTimeMillis()
+        val cacheItems = loadCountryCacheItems()
+        val refreshed = ArrayList<CountryCodeCacheItem>(cacheItems.size + 1)
+        for (item in cacheItems) {
+            if (item.ip == ip) continue
+            if (now - item.updatedAtMs > COUNTRY_CACHE_TTL_MS) continue
+            refreshed.add(item)
+        }
+        refreshed.add(
+            CountryCodeCacheItem(
+                ip = ip,
+                countryCode = countryCode.trim().uppercase(Locale.ROOT),
+                updatedAtMs = now
+            )
+        )
+        persistCountryCacheItems(pruneCountryCache(refreshed))
+    }
+
+    private fun pruneCountryCache(items: List<CountryCodeCacheItem>): List<CountryCodeCacheItem> {
+        val now = System.currentTimeMillis()
+        return items.filter { now - it.updatedAtMs <= COUNTRY_CACHE_TTL_MS }
+            .sortedBy { it.updatedAtMs }
+    }
+
+    private fun loadCountryCacheItems(): List<CountryCodeCacheItem> {
+        val raw = prefs.getCountryCodeCacheJson()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val ip = obj.optString("ip").trim()
+                    val countryCode = obj.optString("countryCode").trim().uppercase(Locale.ROOT)
+                    val updatedAtMs = obj.optLong("updatedAtMs", 0L)
+                    if (ip.isBlank() || countryCode.isBlank() || updatedAtMs <= 0L) continue
+                    add(
+                        CountryCodeCacheItem(
+                            ip = ip,
+                            countryCode = countryCode,
+                            updatedAtMs = updatedAtMs
+                        )
+                    )
+                }
+            }
+        }.getOrElse {
+            AppLogger.w(this, TAG, "fcm_metric", "country_cache_parse_failed", "error=${it.message}")
+            emptyList()
+        }
+    }
+
+    private fun persistCountryCacheItems(items: List<CountryCodeCacheItem>) {
+        val arr = JSONArray()
+        items.forEach { item ->
+            arr.put(
+                JSONObject().apply {
+                    put("ip", item.ip)
+                    put("countryCode", item.countryCode)
+                    put("updatedAtMs", item.updatedAtMs)
+                }
+            )
+        }
+        prefs.setCountryCodeCacheJson(arr.toString())
     }
 
     private fun buildStatusLine(meta: String): String {
@@ -523,12 +725,9 @@ class ImeSwitchService : Service() {
         private const val RECHECK_DELAY_MS = 30_000L
         private const val RECHECK_MAX_ATTEMPTS = 3
         private const val API_TIMEOUT_MS = 5_000
+        private const val COUNTRY_CACHE_TTL_MS = 7L * 24L * 60L * 60L * 1000L
         private const val PLACEHOLDER_METRIC = "-"
         private const val FCM_PLACEHOLDER_META = "diagnosis=pending"
-        private val FCM_DOMAIN_REGEX = Regex(
-            """\b((?:mtalk|fcm|gcm)[a-zA-Z0-9.-]*\.google\.com(?::\d{2,5})?)\b""",
-            RegexOption.IGNORE_CASE
-        )
 
         const val ACTION_START = "com.example.fcmkeepalive.action.START"
     }
@@ -536,6 +735,17 @@ class ImeSwitchService : Service() {
     private data class DumpsysResult(
         val output: String?,
         val reason: String?
+    )
+
+    private data class CountryCodeCacheItem(
+        val ip: String,
+        val countryCode: String,
+        val updatedAtMs: Long
+    )
+
+    private data class CountryCacheLookup(
+        val countryCode: String?,
+        val state: String
     )
 
     enum class EventType {

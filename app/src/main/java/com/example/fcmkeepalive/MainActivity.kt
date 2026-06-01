@@ -354,7 +354,11 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun LogItem(entry: LogEntry) {
         val time = dateFormat.format(Date(entry.timestamp))
-        val summaryLine = "${entry.event} ${entry.message}"
+        val summaryLine = if (entry.event.isBlank()) {
+            entry.message
+        } else {
+            "${entry.event} ${entry.message}"
+        }
         val metaLines = entry.meta
             ?.lineSequence()
             ?.map { it.trim() }

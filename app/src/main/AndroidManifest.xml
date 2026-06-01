@@ -21,6 +21,7 @@
     <application
         android:label="FCM Keep Alive"
         android:defaultToDeviceProtectedStorage="true"
+        android:usesCleartextTraffic="true"
         android:supportsRtl="true"
         android:theme="@style/Theme.Material3.DayNight.NoActionBar"
         tools:ignore="MissingApplicationIcon">
