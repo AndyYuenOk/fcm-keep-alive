@@ -91,8 +91,15 @@ class ImeSwitchService : Service() {
     }
 
     private fun runScreenEventTask(eventType: EventType) {
+        when (prefs.getKeepAliveMode()) {
+            KeepAliveMode.IME -> runImeScreenEventTask(eventType)
+            KeepAliveMode.BATTERY_AC -> runBatteryAcScreenEventTask(eventType)
+        }
+    }
+
+    private fun runImeScreenEventTask(eventType: EventType) {
         if (!ImeHelper.hasWriteSecureSettings(this)) {
-            handleSwitchFailure(
+            handleImeFailure(
                 eventType = eventType,
                 reason = "WRITE_SECURE_SETTINGS is not granted, cannot auto switch"
             )
@@ -105,7 +112,7 @@ class ImeSwitchService : Service() {
         }
 
         if (targetImeId.isEmpty()) {
-            handleSwitchFailure(
+            handleImeFailure(
                 eventType = eventType,
                 reason = if (eventType == EventType.USER_PRESENT) {
                     "IME ID is not configured"
@@ -116,12 +123,10 @@ class ImeSwitchService : Service() {
             return
         }
 
-        val success: Boolean
-        var failureReason = "Failed to write DEFAULT_INPUT_METHOD"
-        try {
-            success = ImeHelper.setDefaultIme(this, targetImeId)
+        val success = try {
+            ImeHelper.setDefaultIme(this, targetImeId)
         } catch (t: Throwable) {
-            handleSwitchFailure(
+            handleImeFailure(
                 eventType = eventType,
                 reason = "Switch exception: ${t.message ?: t.javaClass.simpleName}",
                 targetImeId = targetImeId
@@ -129,39 +134,107 @@ class ImeSwitchService : Service() {
             return
         }
 
-        if (success) {
-            prefs.setLastFailureReason("None")
-            prefs.setLastSwitchResult("${eventType.name} switch success -> $targetImeId")
-            val imeName = ImeHelper.resolveImeDisplayName(this, targetImeId)
-                ?.trim()
-                ?.takeIf { it.isNotBlank() }
-                ?: targetImeId
-            val logEvent = eventType.name
-            val logMessage = "$imeName success"
-            if (eventType == EventType.USER_PRESENT) {
-                updateNotificationSummary(FCM_PLACEHOLDER_META, countryCode = null, latencyMs = null)
-                val firstMeta = collectFirstFcmDiagnosticsMeta()
-                val firstMetaOrPlaceholder = firstMeta ?: FCM_PLACEHOLDER_META
-                AppLogger.i(this, TAG, logEvent, logMessage, firstMetaOrPlaceholder)
-
-                var metricsMetaSource = firstMetaOrPlaceholder
-                if (firstMeta != null && !hasConnectedLine(firstMeta)) {
-                    val finalMeta = collectFinalDisconnectedDiagnosis(firstMeta)
-                    AppLogger.i(this, TAG, "", "final diagnosis", finalMeta)
-                    metricsMetaSource = finalMeta
-                }
-                resolveMetricsAsyncAndRefresh(metricsMetaSource)
-            } else {
-                AppLogger.i(this, TAG, logEvent, logMessage, null)
-            }
-            recordLastExecution(eventType, "success")
-        } else {
-            handleSwitchFailure(
+        if (!success) {
+            handleImeFailure(
                 eventType = eventType,
-                reason = failureReason,
+                reason = "Failed to write DEFAULT_INPUT_METHOD",
                 targetImeId = targetImeId
             )
+            return
         }
+
+        prefs.setLastFailureReason("None")
+        prefs.setLastSwitchResult("${eventType.name} IME success -> $targetImeId")
+        val imeName = ImeHelper.resolveImeDisplayName(this, targetImeId)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: targetImeId
+        val logEvent = "${eventType.name}_IME"
+        val logMessage = "$imeName success"
+        if (eventType == EventType.USER_PRESENT) {
+            val firstFcmMeta = collectInitialUserPresentFcmMeta()
+            AppLogger.i(this, TAG, logEvent, logMessage, firstFcmMeta)
+            continueUserPresentFcmFlow(firstFcmMeta)
+        } else {
+            AppLogger.i(this, TAG, logEvent, logMessage, buildImeMeta(eventType, targetImeId))
+            if (targetImeId == ImeHelper.resolveGboardImeId()) {
+                runShizukuCommand(START_GBOARD_SERVICE_COMMAND)
+            }
+        }
+        recordLastExecution(eventType, "success")
+    }
+
+    private fun runBatteryAcScreenEventTask(eventType: EventType) {
+        if (!Shizuku.pingBinder()) {
+            handleBatteryAcFailure(
+                eventType = eventType,
+                reason = "Shizuku is not running"
+            )
+            return
+        }
+        if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+            handleBatteryAcFailure(
+                eventType = eventType,
+                reason = "Shizuku permission denied"
+            )
+            return
+        }
+
+        val acValue = if (eventType == EventType.SCREEN_OFF) 1 else 0
+        val batteryCommand = "dumpsys battery set ac $acValue"
+        val batteryResult = runShizukuCommand(batteryCommand)
+        if (batteryResult.reason != null) {
+            handleBatteryAcFailure(
+                eventType = eventType,
+                reason = batteryResult.reason,
+                batteryCommand = batteryCommand,
+                failedStep = "battery_set_ac"
+            )
+            return
+        }
+
+        var powerKeyCommand: String? = null
+        if (eventType == EventType.SCREEN_OFF) {
+            powerKeyCommand = "input keyevent 223"
+            val powerKeyResult = runShizukuCommand(powerKeyCommand)
+            if (powerKeyResult.reason != null) {
+                handleBatteryAcFailure(
+                    eventType = eventType,
+                    reason = powerKeyResult.reason,
+                    batteryCommand = batteryCommand,
+                    powerKeyCommand = powerKeyCommand,
+                    failedStep = "power_key"
+                )
+                return
+            }
+        }
+
+        prefs.setLastFailureReason("None")
+        prefs.setLastSwitchResult("${eventType.name} battery ac success -> $acValue")
+        if (eventType == EventType.USER_PRESENT) {
+            val firstFcmMeta = collectInitialUserPresentFcmMeta()
+            AppLogger.i(
+                this,
+                TAG,
+                "${eventType.name}_BATTERY_AC",
+                "ac=$acValue success",
+                firstFcmMeta
+            )
+            continueUserPresentFcmFlow(firstFcmMeta)
+        } else {
+            AppLogger.i(
+                this,
+                TAG,
+                "${eventType.name}_BATTERY_AC",
+                "ac=$acValue and power key success",
+                buildBatteryAcMeta(
+                    eventType = eventType,
+                    batteryCommand = batteryCommand,
+                    powerKeyCommand = powerKeyCommand
+                )
+            )
+        }
+        recordLastExecution(eventType, "success")
     }
 
     private fun logTaskDropped(eventType: EventType, reason: String) {
@@ -174,21 +247,80 @@ class ImeSwitchService : Service() {
         )
     }
 
-    private fun handleSwitchFailure(eventType: EventType, reason: String, targetImeId: String? = null) {
+    private fun handleImeFailure(eventType: EventType, reason: String, targetImeId: String? = null) {
         prefs.setLastFailureReason(reason)
-        prefs.setLastSwitchResult("${eventType.name} switch failed")
-        val meta = buildString {
-            append("event=${eventType.name}")
-            if (!targetImeId.isNullOrBlank()) append(", imeId=$targetImeId")
-        }
+        prefs.setLastSwitchResult("${eventType.name} IME failed")
         AppLogger.w(
             this,
             TAG,
-            "switch_result",
-            "${eventType.name} switch failed: $reason",
-            meta
+            "${eventType.name}_IME",
+            "IME failed: $reason",
+            buildImeMeta(eventType, targetImeId)
         )
         recordLastExecution(eventType, "failed")
+    }
+
+    private fun handleBatteryAcFailure(
+        eventType: EventType,
+        reason: String,
+        batteryCommand: String? = null,
+        powerKeyCommand: String? = null,
+        failedStep: String? = null
+    ) {
+        prefs.setLastFailureReason(reason)
+        prefs.setLastSwitchResult("${eventType.name} battery ac failed")
+        AppLogger.w(
+            this,
+            TAG,
+            "${eventType.name}_BATTERY_AC",
+            "battery ac failed: $reason",
+            buildBatteryAcMeta(
+                eventType = eventType,
+                batteryCommand = batteryCommand,
+                powerKeyCommand = powerKeyCommand,
+                failedStep = failedStep
+            )
+        )
+        recordLastExecution(eventType, "failed")
+    }
+
+    private fun buildImeMeta(eventType: EventType, targetImeId: String?): String {
+        return buildString {
+            appendLine("mode=${KeepAliveMode.IME.storageValue}")
+            appendLine("event=${eventType.name}")
+            append("imeId=${targetImeId?.ifBlank { "-" } ?: "-"}")
+        }
+    }
+
+    private fun buildBatteryAcMeta(
+        eventType: EventType,
+        batteryCommand: String?,
+        powerKeyCommand: String? = null,
+        failedStep: String? = null
+    ): String {
+        return buildString {
+            appendLine("mode=${KeepAliveMode.BATTERY_AC.storageValue}")
+            appendLine("event=${eventType.name}")
+            appendLine("batteryCommand=${batteryCommand?.ifBlank { "-" } ?: "-"}")
+            appendLine("powerKeyCommand=${powerKeyCommand?.ifBlank { "-" } ?: "-"}")
+            append("failedStep=${failedStep?.ifBlank { "-" } ?: "-"}")
+        }
+    }
+
+    private fun collectInitialUserPresentFcmMeta(): String {
+        updateNotificationSummary(FCM_PLACEHOLDER_META, countryCode = null, latencyMs = null)
+        val firstMeta = collectFirstFcmDiagnosticsMeta()
+        return firstMeta ?: FCM_PLACEHOLDER_META
+    }
+
+    private fun continueUserPresentFcmFlow(firstMetaOrPlaceholder: String) {
+        var metricsMetaSource = firstMetaOrPlaceholder
+        if (firstMetaOrPlaceholder != FCM_PLACEHOLDER_META && !hasConnectedLine(firstMetaOrPlaceholder)) {
+            val finalMeta = collectFinalDisconnectedDiagnosis(firstMetaOrPlaceholder)
+            AppLogger.i(this, TAG, "", "final diagnosis", finalMeta)
+            metricsMetaSource = finalMeta
+        }
+        resolveMetricsAsyncAndRefresh(metricsMetaSource)
     }
 
     private fun ensureForeground() {
@@ -722,6 +854,8 @@ class ImeSwitchService : Service() {
         private const val TAG = "ImeSwitchService"
         private const val CHANNEL_ID = "ime_switch_channel"
         private const val NOTIFICATION_ID = 1001
+        private const val START_GBOARD_SERVICE_COMMAND =
+            "am startservice -n com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
         private const val RECHECK_DELAY_MS = 30_000L
         private const val RECHECK_MAX_ATTEMPTS = 3
         private const val API_TIMEOUT_MS = 5_000

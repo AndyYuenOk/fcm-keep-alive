@@ -28,8 +28,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.ClearAll
 import androidx.compose.material.icons.filled.Keyboard
+import androidx.compose.material.icons.filled.ManageSearch
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FloatingActionButton
@@ -79,10 +81,12 @@ class MainActivity : ComponentActivity() {
     private var showGrantShizukuButton by mutableStateOf(true)
     private var isMenuExpanded by mutableStateOf(false)
     private var isImeDialogVisible by mutableStateOf(false)
+    private var isKeepAliveModeDialogVisible by mutableStateOf(false)
     private var isPowerkeeperDialogVisible by mutableStateOf(false)
     private var powerkeeperDialogText by mutableStateOf("")
     private var imeDialogOptions by mutableStateOf<List<Pair<String, String>>>(emptyList())
     private var imeDialogSelectedIndex by mutableStateOf(0)
+    private var keepAliveModeDialogSelectedIndex by mutableStateOf(0)
     private var snackbarHostState: SnackbarHostState? = null
     private var pendingSnackbarMessage by mutableStateOf<String?>(null)
 
@@ -200,6 +204,14 @@ class MainActivity : ComponentActivity() {
                                 }
                             )
                             ExtendedFloatingActionButton(
+                                text = { Text("Keep Alive Mode") },
+                                icon = { Icon(Icons.Default.Tune, contentDescription = null) },
+                                onClick = {
+                                    showKeepAliveModeSelector()
+                                    isMenuExpanded = false
+                                }
+                            )
+                            ExtendedFloatingActionButton(
                                 text = { Text("IME Settings") },
                                 icon = { Icon(Icons.Default.Settings, contentDescription = null) },
                                 onClick = {
@@ -209,7 +221,7 @@ class MainActivity : ComponentActivity() {
                             )
                             ExtendedFloatingActionButton(
                                 text = { Text("FCM Diagnostics") },
-                                icon = { Icon(Icons.Default.Settings, contentDescription = null) },
+                                icon = { Icon(Icons.Default.ManageSearch, contentDescription = null) },
                                 onClick = {
                                     openFcmDiagnostics()
                                     isMenuExpanded = false
@@ -277,6 +289,9 @@ class MainActivity : ComponentActivity() {
         if (isImeDialogVisible) {
             ImeSelectorDialog()
         }
+        if (isKeepAliveModeDialogVisible) {
+            KeepAliveModeDialog()
+        }
         if (isPowerkeeperDialogVisible) {
             PowerkeeperResultDialog()
         }
@@ -325,6 +340,54 @@ class MainActivity : ComponentActivity() {
             },
             dismissButton = {
                 TextButton(onClick = { isImeDialogVisible = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    @Composable
+    private fun KeepAliveModeDialog() {
+        val options = KeepAliveMode.entries
+        AlertDialog(
+            onDismissRequest = { isKeepAliveModeDialogVisible = false },
+            title = { Text("Keep Alive Mode") },
+            text = {
+                Column {
+                    options.forEachIndexed { index, mode ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { keepAliveModeDialogSelectedIndex = index }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = keepAliveModeDialogSelectedIndex == index,
+                                onClick = { keepAliveModeDialogSelectedIndex = index }
+                            )
+                            Text(
+                                text = mode.displayName,
+                                modifier = Modifier.padding(start = 8.dp)
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val selectedMode = options[keepAliveModeDialogSelectedIndex]
+                        prefs.setKeepAliveMode(selectedMode)
+                        showSnackbarMessage("Current mode: ${selectedMode.displayName}")
+                        isKeepAliveModeDialogVisible = false
+                    }
+                ) {
+                    Text("Save")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { isKeepAliveModeDialogVisible = false }) {
                     Text("Cancel")
                 }
             }
@@ -799,6 +862,13 @@ class MainActivity : ComponentActivity() {
         imeDialogSelectedIndex = imePairs.indexOfFirst { it.second == prefs.getChosenImeId() }
             .let { if (it < 0) 0 else it }
         isImeDialogVisible = true
+    }
+
+    private fun showKeepAliveModeSelector() {
+        keepAliveModeDialogSelectedIndex = KeepAliveMode.entries
+            .indexOf(prefs.getKeepAliveMode())
+            .let { if (it < 0) 0 else it }
+        isKeepAliveModeDialogVisible = true
     }
 
     private fun showSnackbarMessage(message: String) {

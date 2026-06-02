@@ -19,6 +19,16 @@ class AppPrefs(context: Context) {
         prefs.edit { putString(KEY_CHOSEN_IME_ID, imeId) }
     }
 
+    fun getKeepAliveMode(): KeepAliveMode {
+        val raw = prefs.getString(KEY_KEEP_ALIVE_MODE, KeepAliveMode.IME.storageValue)
+            ?: KeepAliveMode.IME.storageValue
+        return KeepAliveMode.fromStorageValue(raw)
+    }
+
+    fun setKeepAliveMode(mode: KeepAliveMode) {
+        prefs.edit { putString(KEY_KEEP_ALIVE_MODE, mode.storageValue) }
+    }
+
     fun getLastSwitchResult(): String = prefs.getString(KEY_LAST_SWITCH_RESULT, "Not executed") ?: "Not executed"
 
     fun setLastSwitchResult(result: String) {
@@ -99,6 +109,7 @@ class AppPrefs(context: Context) {
     companion object {
         private const val PREFS_NAME = "ime_switcher_prefs"
         private const val KEY_CHOSEN_IME_ID = "chosen_ime_id"
+        private const val KEY_KEEP_ALIVE_MODE = "keep_alive_mode"
         private const val KEY_LAST_SWITCH_RESULT = "last_switch_result"
         private const val KEY_LAST_FAILURE_REASON = "last_failure_reason"
         private const val KEY_LOG_ENTRIES_JSON = "log_entries_json"
@@ -109,5 +120,19 @@ class AppPrefs(context: Context) {
         private const val KEY_FCM_NOTIFY_STATS_LINE = "fcm_notify_stats_line"
         private const val KEY_FCM_NOTIFY_COUNTRY_CODE = "fcm_notify_country_code"
         private const val KEY_COUNTRY_CODE_CACHE_JSON = "country_code_cache_json"
+    }
+}
+
+enum class KeepAliveMode(
+    val storageValue: String,
+    val displayName: String
+) {
+    IME(storageValue = "ime", displayName = "IME Switch"),
+    BATTERY_AC(storageValue = "battery_ac", displayName = "Charging Keep Alive");
+
+    companion object {
+        fun fromStorageValue(value: String): KeepAliveMode {
+            return entries.firstOrNull { it.storageValue == value } ?: IME
+        }
     }
 }
