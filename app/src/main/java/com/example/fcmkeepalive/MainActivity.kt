@@ -28,7 +28,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.ClearAll
 import androidx.compose.material.icons.filled.Keyboard
-import androidx.compose.material.icons.filled.ManageSearch
+import androidx.compose.material.icons.filled.LocalFireDepartment
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Tune
@@ -195,14 +195,16 @@ class MainActivity : ComponentActivity() {
                             horizontalAlignment = Alignment.End,
                             modifier = Modifier.padding(bottom = 12.dp)
                         ) {
-                            ExtendedFloatingActionButton(
-                                text = { Text("Choose IME") },
-                                icon = { Icon(Icons.Default.Keyboard, contentDescription = null) },
-                                onClick = {
-                                    showImeSelector()
-                                    isMenuExpanded = false
-                                }
-                            )
+                            if (showGrantShizukuButton) {
+                                ExtendedFloatingActionButton(
+                                    text = { Text("Grant Shizuku") },
+                                    icon = { Icon(Icons.Default.Build, contentDescription = null) },
+                                    onClick = {
+                                        requestShizukuAndGrantSecureSettings()
+                                        isMenuExpanded = false
+                                    }
+                                )
+                            }
                             ExtendedFloatingActionButton(
                                 text = { Text("Keep Alive Mode") },
                                 icon = { Icon(Icons.Default.Tune, contentDescription = null) },
@@ -212,18 +214,18 @@ class MainActivity : ComponentActivity() {
                                 }
                             )
                             ExtendedFloatingActionButton(
-                                text = { Text("IME Settings") },
-                                icon = { Icon(Icons.Default.Settings, contentDescription = null) },
+                                text = { Text("Choose IME") },
+                                icon = { Icon(Icons.Default.Keyboard, contentDescription = null) },
                                 onClick = {
-                                    startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+                                    showImeSelector()
                                     isMenuExpanded = false
                                 }
                             )
                             ExtendedFloatingActionButton(
-                                text = { Text("FCM Diagnostics") },
-                                icon = { Icon(Icons.Default.ManageSearch, contentDescription = null) },
+                                text = { Text("IME Settings") },
+                                icon = { Icon(Icons.Default.Settings, contentDescription = null) },
                                 onClick = {
-                                    openFcmDiagnostics()
+                                    startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
                                     isMenuExpanded = false
                                 }
                             )
@@ -243,16 +245,14 @@ class MainActivity : ComponentActivity() {
                                     isMenuExpanded = false
                                 }
                             )
-                            if (showGrantShizukuButton) {
-                                ExtendedFloatingActionButton(
-                                    text = { Text("Grant Shizuku") },
-                                    icon = { Icon(Icons.Default.Build, contentDescription = null) },
-                                    onClick = {
-                                        requestShizukuAndGrantSecureSettings()
-                                        isMenuExpanded = false
-                                    }
-                                )
-                            }
+                            ExtendedFloatingActionButton(
+                                text = { Text("FCM Diagnostics") },
+                                icon = { Icon(Icons.Default.LocalFireDepartment, contentDescription = null) },
+                                onClick = {
+                                    openFcmDiagnostics()
+                                    isMenuExpanded = false
+                                }
+                            )
                             ExtendedFloatingActionButton(
                                 text = { Text("Clear Logs") },
                                 icon = { Icon(Icons.Default.ClearAll, contentDescription = null) },
@@ -417,21 +417,47 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun LogItem(entry: LogEntry) {
         val time = dateFormat.format(Date(entry.timestamp))
-        val summaryLine = if (entry.event.isBlank()) {
-            entry.message
-        } else {
-            "${entry.event} ${entry.message}"
-        }
         val metaLines = entry.meta
             ?.lineSequence()
             ?.map { it.trim() }
             ?.filter { it.isNotBlank() }
             ?.toList()
             .orEmpty()
+        val normalizedEvent = entry.event.removeSuffix("_IME")
+        val metaMap = parseMetaMap(metaLines)
+        val isLegacyImeEvent = entry.event.endsWith("_IME")
+        val isImeMetaLog = metaLines.any { it == "mode=ime" } && metaLines.any { it.startsWith("imeId=") }
+        val hasFcmMeta = hasFcmDiagnosticsMeta(metaLines)
+        val hasBatteryAcMeta = isBatteryAcLog(metaMap)
+        val shouldCondenseImeLog = isImeMetaLog || (isLegacyImeEvent && !hasFcmDiagnosticsMeta(metaLines))
+        val contentLines = when {
+            entry.event == "fcm_metric" && entry.message == "country_latency" -> {
+                listOf(buildCountryLatencySummary(metaLines))
+            }
+            shouldCondenseImeLog -> {
+                listOf("$normalizedEvent, ${entry.message}")
+            }
+            hasBatteryAcMeta && hasFcmMeta -> {
+                listOf(buildBatteryAcSummaryLine(normalizedEvent, metaMap)) + extractFcmMetaLines(metaLines)
+            }
+            entry.event.isNotBlank() && !hasFcmMeta -> {
+                listOf(buildNonFcmSummaryLine(entry, normalizedEvent, metaMap))
+            }
+            else -> {
+                val summaryLine = when {
+                    entry.event.isBlank() -> entry.message
+                    entry.event == "fcm_metric" -> entry.message
+                    hasFcmMeta &&
+                        entry.message.contains("switch success", ignoreCase = true) ->
+                        "${normalizedEvent}, ${entry.message}"
+                    else -> "${normalizedEvent} ${entry.message}"
+                }
+                listOf(summaryLine) + metaLines
+            }
+        }
         val selectableText = buildString {
             appendLine(time)
-            appendLine(summaryLine)
-            metaLines.forEach { line -> appendLine(line) }
+            contentLines.forEach { line -> appendLine(line) }
         }.trimEnd()
 
         Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
@@ -443,6 +469,125 @@ class MainActivity : ComponentActivity() {
                 )
             }
             HorizontalDivider(modifier = Modifier.padding(top = 6.dp))
+        }
+    }
+
+    private fun buildCountryLatencySummary(metaLines: List<String>): String {
+        val metaMap = parseMetaMap(metaLines)
+        val countryCode = metaMap["countryCode"].orEmpty().ifBlank { "-" }
+        val ip = metaMap["ip"].orEmpty().ifBlank { "-" }
+        val cache = metaMap["cache"].orEmpty().ifBlank { "-" }
+        return "$countryCode $ip cache=$cache"
+    }
+
+    private fun buildNonFcmSummaryLine(
+        entry: LogEntry,
+        normalizedEvent: String,
+        metaMap: Map<String, String>
+    ): String {
+        if (isBatteryAcLog(metaMap)) {
+            return buildBatteryAcSummaryLine(normalizedEvent, metaMap)
+        }
+        return if (entry.event.isBlank()) {
+            entry.message
+        } else {
+            "$normalizedEvent, ${entry.message}"
+        }
+    }
+
+    private fun buildBatteryAcSummaryLine(normalizedEvent: String, metaMap: Map<String, String>): String {
+        val eventLabel = normalizedEvent.removeSuffix("_AC")
+        val failedStep = metaMap["failedStep"].orEmpty().takeUnless { it.isBlank() || it == "-" }
+        val steps = mutableListOf<String>()
+        val acValue = extractBatteryAcValue(metaMap["batteryCommand"])
+
+        appendStepResult(
+            steps = steps,
+            label = "mute",
+            wasAttempted = metaMap["disablePowerSoundsCommand"].hasRealValue(),
+            didFail = metaMap["disablePowerSoundsReason"].hasRealValue() || failedStep == "power_sounds_disable"
+        )
+        appendStepResult(
+            steps = steps,
+            label = if (acValue == "reset") "battery reset" else if (acValue != null) "set ac $acValue" else "set ac",
+            wasAttempted = metaMap["batteryCommand"].hasRealValue(),
+            didFail = failedStep == "battery_reset"
+        )
+        appendStepResult(
+            steps = steps,
+            label = "power key",
+            wasAttempted = metaMap["powerKeyCommand"].hasRealValue(),
+            didFail = failedStep == "power_key"
+        )
+        appendStepResult(
+            steps = steps,
+            label = "restore sounds",
+            wasAttempted = metaMap["restorePowerSoundsCommand"].hasRealValue(),
+            didFail = metaMap["restorePowerSoundsReason"].hasRealValue() || failedStep == "power_sounds_restore"
+        )
+
+        return (listOf(eventLabel) + steps).joinToString(separator = ", ")
+    }
+
+    private fun appendStepResult(
+        steps: MutableList<String>,
+        label: String,
+        wasAttempted: Boolean,
+        didFail: Boolean
+    ) {
+        if (!wasAttempted) return
+        steps += "$label ${if (didFail) "failed" else "success"}"
+    }
+
+    private fun isBatteryAcLog(metaMap: Map<String, String>): Boolean {
+        return metaMap["mode"] == "battery_ac"
+    }
+
+    private fun extractBatteryAcValue(command: String?): String? {
+        val parts = command
+            ?.takeIf { it.hasRealValue() }
+            ?.trim()
+            ?.split(Regex("\\s+"))
+            .orEmpty()
+        if (parts.size >= 3 && parts[0] == "dumpsys" && parts[1] == "battery" && parts[2] == "reset") {
+            return "reset"
+        }
+        return parts.lastOrNull()
+            ?.takeIf { it == "0" || it == "1" }
+    }
+
+    private fun parseMetaMap(metaLines: List<String>): Map<String, String> {
+        return metaLines.mapNotNull { line ->
+            val separatorIndex = line.indexOf('=')
+            if (separatorIndex <= 0) return@mapNotNull null
+            val key = line.substring(0, separatorIndex).trim()
+            val value = line.substring(separatorIndex + 1).trim()
+            key to value
+        }.toMap()
+    }
+
+    private fun String?.hasRealValue(): Boolean {
+        return !this.isNullOrBlank() && this != "-"
+    }
+
+    private fun hasFcmDiagnosticsMeta(metaLines: List<String>): Boolean {
+        return metaLines.any { it.startsWith("Heartbeat:", ignoreCase = true) } ||
+            metaLines.any { it.startsWith("Last ping:", ignoreCase = true) } ||
+            metaLines.any { it.startsWith("streamId=", ignoreCase = true) } ||
+            metaLines.any { it.startsWith("connected=", ignoreCase = true) } ||
+            metaLines.any { it.startsWith("diagnosis=", ignoreCase = true) }
+    }
+
+    private fun extractFcmMetaLines(metaLines: List<String>): List<String> {
+        return metaLines.filter { line ->
+            line.startsWith("Heartbeat:", ignoreCase = true) ||
+                line.startsWith("Last ping:", ignoreCase = true) ||
+                line.startsWith("streamId=", ignoreCase = true) ||
+                line.startsWith("connected=", ignoreCase = true) ||
+                line.startsWith("diagnosis=", ignoreCase = true) ||
+                line.startsWith("connectTime=", ignoreCase = true) ||
+                line.startsWith("Adaptive Heartbeat type", ignoreCase = true) ||
+                line.startsWith("connectionsLimit:", ignoreCase = true)
         }
     }
 

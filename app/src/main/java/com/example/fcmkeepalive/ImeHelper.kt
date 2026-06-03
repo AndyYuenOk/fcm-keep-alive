@@ -11,6 +11,8 @@ object ImeHelper {
     const val GBOARD_IME_ID =
         "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
 
+    private val ENGLISH_LABEL_REGEX = Regex("^[A-Za-z0-9 ._\\-+&()]+$")
+
     fun hasWriteSecureSettings(context: Context): Boolean {
         return ContextCompat.checkSelfPermission(
             context,
@@ -49,7 +51,11 @@ object ImeHelper {
         val pm = context.packageManager
         return imm.enabledInputMethodList.firstOrNull { it.id == imeId }?.let { info ->
             val label = info.loadLabel(pm).toString().trim()
-            label.ifBlank { info.packageName }
+            if (label.isNotBlank() && ENGLISH_LABEL_REGEX.matches(label)) {
+                label
+            } else {
+                info.packageName.substringAfterLast('.').ifBlank { info.packageName }
+            }
         }
     }
 

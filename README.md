@@ -28,5 +28,7 @@ Android app for auto-switching default IME:
 - Apps in the list must be set to No restrictions
 
 ## adb
-`adb shell settings get secure default_input_method`
-`adb shell dumpsys activity service com.google.android.gms/.gcm.GcmService | select -f 10`
+- `adb shell settings get secure default_input_method`
+- `adb shell dumpsys activity services com.google.android.inputmethod.latin`
+- `adb shell dumpsys battery reset`
+- `adb shell dumpsys activity service com.google.android.gms/.gcm.GcmService | select -f 10`

@@ -24,13 +24,17 @@ import java.net.URL
 import java.util.ArrayList
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.Executors
 
 class ImeSwitchService : Service() {
     private val prefs by lazy { AppPrefs(this) }
     private val notificationManager by lazy { getSystemService(NotificationManager::class.java) }
     private val ioExecutor = Executors.newSingleThreadExecutor()
+    private val diagnosticsExecutor = Executors.newSingleThreadExecutor()
     private val isBroadcastTaskRunning = AtomicBoolean(false)
+    private val pendingScreenEvent = AtomicReference<EventType?>(null)
+    private val isUserPresentDiagnosticsRunning = AtomicBoolean(false)
 
     private val runtimeScreenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -65,19 +69,14 @@ class ImeSwitchService : Service() {
     }
 
     private fun handleScreenEvent(eventType: EventType) {
-        if (!isBroadcastTaskRunning.compareAndSet(false, true)) {
-            logTaskDropped(eventType, "task already running")
-            return
-        }
+        pendingScreenEvent.set(eventType)
+        if (!isBroadcastTaskRunning.compareAndSet(false, true)) return
         try {
             ioExecutor.execute {
-                try {
-                    runScreenEventTask(eventType)
-                } finally {
-                    isBroadcastTaskRunning.set(false)
-                }
+                processPendingScreenEvents()
             }
         } catch (t: Throwable) {
+            pendingScreenEvent.compareAndSet(eventType, null)
             isBroadcastTaskRunning.set(false)
             AppLogger.e(
                 this,
@@ -87,6 +86,20 @@ class ImeSwitchService : Service() {
                 t,
                 "event=${eventType.name}"
             )
+        }
+    }
+
+    private fun processPendingScreenEvents() {
+        while (true) {
+            val eventType = pendingScreenEvent.getAndSet(null)
+            if (eventType != null) {
+                runScreenEventTask(eventType)
+                continue
+            }
+            isBroadcastTaskRunning.set(false)
+            if (pendingScreenEvent.get() == null || !isBroadcastTaskRunning.compareAndSet(false, true)) {
+                return
+            }
         }
     }
 
@@ -149,22 +162,33 @@ class ImeSwitchService : Service() {
             ?.trim()
             ?.takeIf { it.isNotBlank() }
             ?: targetImeId
-        val logEvent = "${eventType.name}_IME"
-        val logMessage = "$imeName success"
+        val logEvent = eventType.name
         if (eventType == EventType.USER_PRESENT) {
-            val firstFcmMeta = collectInitialUserPresentFcmMeta()
-            AppLogger.i(this, TAG, logEvent, logMessage, firstFcmMeta)
-            continueUserPresentFcmFlow(firstFcmMeta)
-        } else {
+            val logMessage = "$imeName, switch success"
             AppLogger.i(this, TAG, logEvent, logMessage, buildImeMeta(eventType, targetImeId))
-            if (targetImeId == ImeHelper.resolveGboardImeId()) {
-                runShizukuCommand(START_GBOARD_SERVICE_COMMAND)
+            enqueueUserPresentFcmDiagnostics()
+        } else {
+            val logMessage = if (targetImeId == ImeHelper.resolveGboardImeId()) {
+                val serviceStarted = startGboardServiceAndCheckResult()
+                "$imeName, switch success, service ${if (serviceStarted) "success" else "failed"}"
+            } else {
+                "$imeName, switch success"
             }
+            AppLogger.i(this, TAG, logEvent, logMessage, buildImeMeta(eventType, targetImeId))
         }
         recordLastExecution(eventType, "success")
     }
 
     private fun runBatteryAcScreenEventTask(eventType: EventType) {
+        if (eventType == EventType.SCREEN_OFF && !prefs.isBatteryAcScreenOffArmed()) {
+            return
+        }
+        if (eventType == EventType.SCREEN_OFF) {
+            prefs.setBatteryAcScreenOffArmed(false)
+        } else if (eventType == EventType.USER_PRESENT) {
+            prefs.setBatteryAcScreenOffArmed(true)
+        }
+
         if (!Shizuku.pingBinder()) {
             handleBatteryAcFailure(
                 eventType = eventType,
@@ -181,70 +205,95 @@ class ImeSwitchService : Service() {
         }
 
         val acValue = if (eventType == EventType.SCREEN_OFF) 1 else 0
-        val batteryCommand = "dumpsys battery set ac $acValue"
-        val batteryResult = runShizukuCommand(batteryCommand)
-        if (batteryResult.reason != null) {
+        val batteryReset = eventType == EventType.USER_PRESENT
+        val disablePowerSoundsCommand = "settings put global power_sounds_enabled 0"
+        val restorePowerSoundsCommand = "settings put global power_sounds_enabled 1"
+        val batteryCommand = if (batteryReset) {
+            "dumpsys battery reset"
+        } else {
+            "dumpsys battery set ac $acValue"
+        }
+        val powerKeyCommand = if (eventType == EventType.SCREEN_OFF) "input keyevent 26" else null
+        val disablePowerSoundsReason = runShizukuCommandSilently(disablePowerSoundsCommand).reason
+        var restorePowerSoundsReason: String? = null
+        var failureReason: String? = null
+        var failedStep: String? = null
+
+        try {
+            val batteryReason = runShizukuCommandSilently(batteryCommand).reason
+            if (batteryReason != null) {
+                failureReason = batteryReason
+                failedStep = "battery_reset"
+                return
+            }
+
+            if (powerKeyCommand != null) {
+                val powerKeyReason = runShizukuCommandSilently(powerKeyCommand).reason
+                if (powerKeyReason != null) {
+                    failureReason = powerKeyReason
+                    failedStep = "power_key"
+                    return
+                }
+            }
+        } finally {
+            if (eventType == EventType.USER_PRESENT) {
+                sleep(500L)
+            }
+            restorePowerSoundsReason = runShizukuCommandSilently(restorePowerSoundsCommand).reason
+        }
+
+        if (failureReason == null && restorePowerSoundsReason != null) {
+            failureReason = restorePowerSoundsReason
+            failedStep = "power_sounds_restore"
+        }
+
+        if (failureReason != null) {
             handleBatteryAcFailure(
                 eventType = eventType,
-                reason = batteryResult.reason,
+                reason = failureReason,
                 batteryCommand = batteryCommand,
-                failedStep = "battery_set_ac"
+                powerKeyCommand = powerKeyCommand,
+                disablePowerSoundsCommand = disablePowerSoundsCommand,
+                restorePowerSoundsCommand = restorePowerSoundsCommand,
+                disablePowerSoundsReason = disablePowerSoundsReason,
+                restorePowerSoundsReason = restorePowerSoundsReason,
+                failedStep = failedStep
             )
             return
         }
 
-        var powerKeyCommand: String? = null
-        if (eventType == EventType.SCREEN_OFF) {
-            powerKeyCommand = "input keyevent 223"
-            val powerKeyResult = runShizukuCommand(powerKeyCommand)
-            if (powerKeyResult.reason != null) {
-                handleBatteryAcFailure(
-                    eventType = eventType,
-                    reason = powerKeyResult.reason,
-                    batteryCommand = batteryCommand,
-                    powerKeyCommand = powerKeyCommand,
-                    failedStep = "power_key"
-                )
-                return
-            }
-        }
-
         prefs.setLastFailureReason("None")
-        prefs.setLastSwitchResult("${eventType.name} battery ac success -> $acValue")
+        prefs.setLastSwitchResult(
+            if (batteryReset) "${eventType.name} battery reset success" else "${eventType.name} ac success -> $acValue"
+        )
+        val batteryMeta = buildBatteryAcMeta(
+            eventType = eventType,
+            batteryCommand = batteryCommand,
+            powerKeyCommand = powerKeyCommand,
+            disablePowerSoundsCommand = disablePowerSoundsCommand,
+            restorePowerSoundsCommand = restorePowerSoundsCommand,
+            disablePowerSoundsReason = disablePowerSoundsReason,
+            restorePowerSoundsReason = restorePowerSoundsReason
+        )
         if (eventType == EventType.USER_PRESENT) {
-            val firstFcmMeta = collectInitialUserPresentFcmMeta()
             AppLogger.i(
                 this,
                 TAG,
-                "${eventType.name}_BATTERY_AC",
-                "ac=$acValue success",
-                firstFcmMeta
+                "${eventType.name}_AC",
+                if (batteryReset) "battery reset success" else "ac=$acValue set success",
+                batteryMeta
             )
-            continueUserPresentFcmFlow(firstFcmMeta)
+            enqueueUserPresentFcmDiagnostics()
         } else {
             AppLogger.i(
                 this,
                 TAG,
-                "${eventType.name}_BATTERY_AC",
-                "ac=$acValue and power key success",
-                buildBatteryAcMeta(
-                    eventType = eventType,
-                    batteryCommand = batteryCommand,
-                    powerKeyCommand = powerKeyCommand
-                )
+                "${eventType.name}_AC",
+                "ac=$acValue set success, power key success",
+                batteryMeta
             )
         }
         recordLastExecution(eventType, "success")
-    }
-
-    private fun logTaskDropped(eventType: EventType, reason: String) {
-        AppLogger.w(
-            this,
-            TAG,
-            "switch_task",
-            "${eventType.name} dropped: $reason",
-            "event=${eventType.name}, reason=$reason"
-        )
     }
 
     private fun handleImeFailure(eventType: EventType, reason: String, targetImeId: String? = null) {
@@ -253,7 +302,7 @@ class ImeSwitchService : Service() {
         AppLogger.w(
             this,
             TAG,
-            "${eventType.name}_IME",
+            eventType.name,
             "IME failed: $reason",
             buildImeMeta(eventType, targetImeId)
         )
@@ -265,19 +314,29 @@ class ImeSwitchService : Service() {
         reason: String,
         batteryCommand: String? = null,
         powerKeyCommand: String? = null,
+        disablePowerSoundsCommand: String? = null,
+        restorePowerSoundsCommand: String? = null,
+        disablePowerSoundsReason: String? = null,
+        restorePowerSoundsReason: String? = null,
         failedStep: String? = null
     ) {
         prefs.setLastFailureReason(reason)
-        prefs.setLastSwitchResult("${eventType.name} battery ac failed")
+        prefs.setLastSwitchResult(
+            if (eventType == EventType.USER_PRESENT) "${eventType.name} battery reset failed" else "${eventType.name} ac failed"
+        )
         AppLogger.w(
             this,
             TAG,
-            "${eventType.name}_BATTERY_AC",
-            "battery ac failed: $reason",
+            "${eventType.name}_AC",
+            if (eventType == EventType.USER_PRESENT) "battery reset failed: $reason" else "ac failed: $reason",
             buildBatteryAcMeta(
                 eventType = eventType,
                 batteryCommand = batteryCommand,
                 powerKeyCommand = powerKeyCommand,
+                disablePowerSoundsCommand = disablePowerSoundsCommand,
+                restorePowerSoundsCommand = restorePowerSoundsCommand,
+                disablePowerSoundsReason = disablePowerSoundsReason,
+                restorePowerSoundsReason = restorePowerSoundsReason,
                 failedStep = failedStep
             )
         )
@@ -296,21 +355,71 @@ class ImeSwitchService : Service() {
         eventType: EventType,
         batteryCommand: String?,
         powerKeyCommand: String? = null,
+        disablePowerSoundsCommand: String? = null,
+        restorePowerSoundsCommand: String? = null,
+        disablePowerSoundsReason: String? = null,
+        restorePowerSoundsReason: String? = null,
         failedStep: String? = null
     ): String {
         return buildString {
             appendLine("mode=${KeepAliveMode.BATTERY_AC.storageValue}")
             appendLine("event=${eventType.name}")
+            appendLine("disablePowerSoundsCommand=${disablePowerSoundsCommand?.ifBlank { "-" } ?: "-"}")
+            appendLine("restorePowerSoundsCommand=${restorePowerSoundsCommand?.ifBlank { "-" } ?: "-"}")
             appendLine("batteryCommand=${batteryCommand?.ifBlank { "-" } ?: "-"}")
             appendLine("powerKeyCommand=${powerKeyCommand?.ifBlank { "-" } ?: "-"}")
+            appendLine("disablePowerSoundsReason=${disablePowerSoundsReason?.ifBlank { "-" } ?: "-"}")
+            appendLine("restorePowerSoundsReason=${restorePowerSoundsReason?.ifBlank { "-" } ?: "-"}")
             append("failedStep=${failedStep?.ifBlank { "-" } ?: "-"}")
         }
+    }
+
+    private fun mergeLogMeta(primary: String?, secondary: String?): String? {
+        val parts = listOfNotNull(
+            primary?.takeIf { it.isNotBlank() },
+            secondary?.takeIf { it.isNotBlank() }
+        )
+        return parts.joinToString(separator = "\n").ifBlank { null }
     }
 
     private fun collectInitialUserPresentFcmMeta(): String {
         updateNotificationSummary(FCM_PLACEHOLDER_META, countryCode = null, latencyMs = null)
         val firstMeta = collectFirstFcmDiagnosticsMeta()
         return firstMeta ?: FCM_PLACEHOLDER_META
+    }
+
+    private fun enqueueUserPresentFcmDiagnostics() {
+        if (!isUserPresentDiagnosticsRunning.compareAndSet(false, true)) {
+            AppLogger.w(
+                this,
+                TAG,
+                "fcm_diag",
+                "USER_PRESENT diagnostics dropped: task already running",
+                "event=USER_PRESENT, reason=task already running"
+            )
+            return
+        }
+        try {
+            diagnosticsExecutor.execute {
+                try {
+                    val firstFcmMeta = collectInitialUserPresentFcmMeta()
+                    AppLogger.i(this, TAG, "fcm_diag", "initial diagnosis", firstFcmMeta)
+                    continueUserPresentFcmFlow(firstFcmMeta)
+                } finally {
+                    isUserPresentDiagnosticsRunning.set(false)
+                }
+            }
+        } catch (t: Throwable) {
+            isUserPresentDiagnosticsRunning.set(false)
+            AppLogger.e(
+                this,
+                TAG,
+                "fcm_diag",
+                "Failed to submit diagnostics task",
+                t,
+                "event=USER_PRESENT"
+            )
+        }
     }
 
     private fun continueUserPresentFcmFlow(firstMetaOrPlaceholder: String) {
@@ -435,7 +544,37 @@ class ImeSwitchService : Service() {
         )
     }
 
+    private fun startGboardServiceAndCheckResult(): Boolean {
+        runShizukuCommandSilently(START_GBOARD_SERVICE_COMMAND)
+        return waitForGboardServiceRunning()
+    }
+
+    private fun waitForGboardServiceRunning(): Boolean {
+        repeat(GBOARD_SERVICE_CHECK_ATTEMPTS) { attempt ->
+            val result = runShizukuCommandSilently(CHECK_GBOARD_SERVICE_COMMAND)
+            val output = result.output.orEmpty()
+            if (
+                output.contains(GBOARD_IME_COMPONENT, ignoreCase = true) ||
+                output.contains(GBOARD_IME_CLASS, ignoreCase = true)
+            ) {
+                return true
+            }
+            if (attempt < GBOARD_SERVICE_CHECK_ATTEMPTS - 1) {
+                sleep(GBOARD_SERVICE_CHECK_DELAY_MS)
+            }
+        }
+        return false
+    }
+
     private fun runShizukuCommand(command: String): DumpsysResult {
+        return runShizukuCommandInternal(command, shouldLog = true)
+    }
+
+    private fun runShizukuCommandSilently(command: String): DumpsysResult {
+        return runShizukuCommandInternal(command, shouldLog = false)
+    }
+
+    private fun runShizukuCommandInternal(command: String, shouldLog: Boolean): DumpsysResult {
         return runCatching {
             val newProcessMethod = Shizuku::class.java.getDeclaredMethod(
                 "newProcess",
@@ -455,20 +594,22 @@ class ImeSwitchService : Service() {
             val error = process.errorStream?.bufferedReader()?.readText().orEmpty()
             if (exitCode != 0) {
                 val reason = if (error.isNotBlank()) error.trim() else "Non-zero exit ($exitCode): $command"
-                AppLogger.w(
-                    this,
-                    TAG,
-                    "shizuku_cmd",
-                    "Command failed",
-                    "command=$command, exit=$exitCode, error=${reason.take(300)}"
-                )
+                if (shouldLog) {
+                    AppLogger.w(
+                        this,
+                        TAG,
+                        "shizuku_cmd",
+                        "Command failed",
+                        "command=$command, exit=$exitCode, error=${reason.take(300)}"
+                    )
+                }
                 return DumpsysResult(
                     output = null,
                     reason = reason
                 )
             }
             val merged = output.ifBlank { error }.takeIf { it.isNotBlank() }
-            if (merged.isNullOrBlank()) {
+            if (shouldLog && merged.isNullOrBlank()) {
                 AppLogger.w(
                     this,
                     TAG,
@@ -479,14 +620,16 @@ class ImeSwitchService : Service() {
             }
             DumpsysResult(output = merged, reason = null)
         }.getOrElse {
-            AppLogger.e(
-                this,
-                TAG,
-                "shizuku_cmd",
-                "Command exception",
-                it,
-                "command=$command"
-            )
+            if (shouldLog) {
+                AppLogger.e(
+                    this,
+                    TAG,
+                    "shizuku_cmd",
+                    "Command exception",
+                    it,
+                    "command=$command"
+                )
+            }
             DumpsysResult(output = null, reason = "Command exception: ${it.message}")
         }
     }
@@ -847,6 +990,7 @@ class ImeSwitchService : Service() {
     override fun onDestroy() {
         runCatching { unregisterReceiver(runtimeScreenReceiver) }
         ioExecutor.shutdownNow()
+        diagnosticsExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -856,6 +1000,13 @@ class ImeSwitchService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val START_GBOARD_SERVICE_COMMAND =
             "am startservice -n com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+        private const val CHECK_GBOARD_SERVICE_COMMAND =
+            "dumpsys activity service com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+        private const val GBOARD_IME_COMPONENT =
+            "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+        private const val GBOARD_IME_CLASS = "com.android.inputmethod.latin.LatinIME"
+        private const val GBOARD_SERVICE_CHECK_DELAY_MS = 300L
+        private const val GBOARD_SERVICE_CHECK_ATTEMPTS = 3
         private const val RECHECK_DELAY_MS = 30_000L
         private const val RECHECK_MAX_ATTEMPTS = 3
         private const val API_TIMEOUT_MS = 5_000
