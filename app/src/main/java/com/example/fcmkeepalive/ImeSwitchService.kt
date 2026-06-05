@@ -2,6 +2,7 @@
 
 import android.app.Notification
 import android.app.NotificationChannel
+import android.app.KeyguardManager
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
@@ -11,7 +12,14 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.database.ContentObserver
+import android.net.Uri
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -24,17 +32,27 @@ import java.net.URL
 import java.util.ArrayList
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.Executors
 
 class ImeSwitchService : Service() {
     private val prefs by lazy { AppPrefs(this) }
     private val notificationManager by lazy { getSystemService(NotificationManager::class.java) }
+    private val keyguardManager by lazy { getSystemService(KeyguardManager::class.java) }
+    private val powerManager by lazy { getSystemService(PowerManager::class.java) }
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val diagnosticsExecutor = Executors.newSingleThreadExecutor()
     private val isBroadcastTaskRunning = AtomicBoolean(false)
     private val pendingScreenEvent = AtomicReference<EventType?>(null)
     private val isUserPresentDiagnosticsRunning = AtomicBoolean(false)
+    private val lastDerivedMappedEvent = AtomicReference<EventType?>(null)
+    private val lastDerivedMappedAtMs = AtomicLong(0L)
+    private val castStateObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean, uri: Uri?) {
+            handleCastStateSettingChanged(uri)
+        }
+    }
 
     private val runtimeScreenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -44,6 +62,13 @@ class ImeSwitchService : Service() {
             } else if (action == Intent.ACTION_USER_PRESENT) {
                 handleScreenEvent(EventType.USER_PRESENT)
             }
+        }
+    }
+
+    private val runtimeMirrorReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != ACTION_MIRROR_DEVICE_CHANGED) return
+            handleMirrorDeviceChanged()
         }
     }
 
@@ -61,6 +86,13 @@ class ImeSwitchService : Service() {
             },
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
+        ContextCompat.registerReceiver(
+            this,
+            runtimeMirrorReceiver,
+            IntentFilter(ACTION_MIRROR_DEVICE_CHANGED),
+            ContextCompat.RECEIVER_EXPORTED
+        )
+        registerCastStateObservers()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -107,6 +139,143 @@ class ImeSwitchService : Service() {
         when (prefs.getKeepAliveMode()) {
             KeepAliveMode.IME -> runImeScreenEventTask(eventType)
             KeepAliveMode.BATTERY_AC -> runBatteryAcScreenEventTask(eventType)
+        }
+    }
+
+    private fun handleMirrorDeviceChanged() {
+        handleDerivedDeviceStateSignal(
+            eventName = MIRROR_EVENT_NAME,
+            source = "mirror",
+            action = ACTION_MIRROR_DEVICE_CHANGED
+        )
+    }
+
+    private fun registerCastStateObservers() {
+        OBSERVED_CAST_SETTINGS.forEach { setting ->
+            contentResolver.registerContentObserver(setting.uri, false, castStateObserver)
+        }
+        AppLogger.i(
+            this,
+            TAG,
+            CAST_STATE_OBSERVER_EVENT_NAME,
+            "observer registered",
+            OBSERVED_CAST_SETTINGS.joinToString(separator = "\n") { setting ->
+                "setting=${setting.namespace.name.lowercase(Locale.ROOT)}:${setting.key}"
+            }
+        )
+    }
+
+    private fun handleCastStateSettingChanged(uri: Uri?) {
+        val setting = OBSERVED_CAST_SETTINGS.firstOrNull { it.uri == uri }
+        val rawState = if (setting != null) {
+            buildString {
+                appendLine("setting=${setting.namespace.name.lowercase(Locale.ROOT)}:${setting.key}")
+                append("value=${readObservedSettingValue(setting) ?: "-"}")
+            }
+        } else {
+            "settingUri=${uri ?: "-"}"
+        }
+        handleDerivedDeviceStateSignal(
+            eventName = CAST_STATE_CHANGED_EVENT_NAME,
+            source = "cast_settings",
+            action = uri?.toString(),
+            rawState = rawState
+        )
+    }
+
+    private fun readObservedSettingValue(setting: ObservedSetting): String? {
+        return when (setting.namespace) {
+            SettingNamespace.GLOBAL -> Settings.Global.getString(contentResolver, setting.key)
+            SettingNamespace.SECURE -> Settings.Secure.getString(contentResolver, setting.key)
+            SettingNamespace.SYSTEM -> Settings.System.getString(contentResolver, setting.key)
+        }
+    }
+
+    private fun handleDerivedDeviceStateSignal(
+        eventName: String,
+        source: String,
+        action: String? = null,
+        rawState: String? = null
+    ) {
+        val snapshot = readDeviceStateSnapshot()
+        val mappedEvent = if (
+            snapshot.isKeyguardLocked ||
+            snapshot.isDeviceLocked ||
+            !snapshot.isInteractive
+        ) {
+            EventType.SCREEN_OFF
+        } else {
+            EventType.USER_PRESENT
+        }
+
+        val nowElapsedMs = SystemClock.elapsedRealtime()
+        val previousEvent = lastDerivedMappedEvent.get()
+        val previousAtMs = lastDerivedMappedAtMs.get()
+        if (
+            previousEvent == mappedEvent &&
+            nowElapsedMs - previousAtMs <= DERIVED_EVENT_DUPLICATE_SUPPRESSION_WINDOW_MS
+        ) {
+            AppLogger.d(
+                this,
+                TAG,
+                eventName,
+                "duplicate ignored for $mappedEvent",
+                buildDeviceStateMeta(
+                    snapshot = snapshot,
+                    mappedEvent = mappedEvent,
+                    duplicateIgnored = true,
+                    source = source,
+                    action = action,
+                    rawState = rawState
+                )
+            )
+            return
+        }
+
+        lastDerivedMappedEvent.set(mappedEvent)
+        lastDerivedMappedAtMs.set(nowElapsedMs)
+        AppLogger.i(
+            this,
+            TAG,
+            eventName,
+            "mapped to $mappedEvent",
+            buildDeviceStateMeta(
+                snapshot = snapshot,
+                mappedEvent = mappedEvent,
+                duplicateIgnored = false,
+                source = source,
+                action = action,
+                rawState = rawState
+            )
+        )
+        handleScreenEvent(mappedEvent)
+    }
+
+    private fun readDeviceStateSnapshot(): DeviceStateSnapshot {
+        return DeviceStateSnapshot(
+            isKeyguardLocked = keyguardManager?.isKeyguardLocked ?: false,
+            isDeviceLocked = keyguardManager?.isDeviceLocked ?: false,
+            isInteractive = powerManager?.isInteractive ?: true
+        )
+    }
+
+    private fun buildDeviceStateMeta(
+        snapshot: DeviceStateSnapshot,
+        mappedEvent: EventType,
+        duplicateIgnored: Boolean,
+        source: String,
+        action: String? = null,
+        rawState: String? = null
+    ): String {
+        return buildString {
+            appendLine("source=$source")
+            appendLine("action=${action?.ifBlank { "-" } ?: "-"}")
+            appendLine("rawState=${rawState?.ifBlank { "-" } ?: "-"}")
+            appendLine("isKeyguardLocked=${snapshot.isKeyguardLocked}")
+            appendLine("isDeviceLocked=${snapshot.isDeviceLocked}")
+            appendLine("isInteractive=${snapshot.isInteractive}")
+            appendLine("mappedEvent=${mappedEvent.name}")
+            append("duplicateIgnored=$duplicateIgnored")
         }
     }
 
@@ -589,9 +758,26 @@ class ImeSwitchService : Service() {
                 null,
                 null
             ) as Process
-            val exitCode = process.waitFor()
-            val output = process.inputStream?.bufferedReader()?.readText().orEmpty()
-            val error = process.errorStream?.bufferedReader()?.readText().orEmpty()
+            val result = ShizukuProcessRunner.run(
+                process = process,
+                timeoutMs = SHIZUKU_COMMAND_TIMEOUT_MS,
+                destroyGraceMs = SHIZUKU_PROCESS_DESTROY_GRACE_MS,
+                streamReadGraceMs = SHIZUKU_STREAM_READ_GRACE_MS
+            )
+            if (result.timedOut) {
+                val reason = buildShizukuTimeoutReason()
+                AppLogger.w(
+                    this,
+                    TAG,
+                    "shizuku_cmd",
+                    "Command timeout",
+                    "command=$command, timeoutMs=$SHIZUKU_COMMAND_TIMEOUT_MS"
+                )
+                return DumpsysResult(output = null, reason = reason)
+            }
+            val output = result.stdout
+            val error = result.stderr
+            val exitCode = result.exitCode ?: -1
             if (exitCode != 0) {
                 val reason = if (error.isNotBlank()) error.trim() else "Non-zero exit ($exitCode): $command"
                 if (shouldLog) {
@@ -632,6 +818,10 @@ class ImeSwitchService : Service() {
             }
             DumpsysResult(output = null, reason = "Command exception: ${it.message}")
         }
+    }
+
+    private fun buildShizukuTimeoutReason(): String {
+        return "Command timeout after ${SHIZUKU_COMMAND_TIMEOUT_MS}ms"
     }
 
     private fun extractFcmDiagnosticsBlock(raw: String): String? {
@@ -989,6 +1179,8 @@ class ImeSwitchService : Service() {
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(runtimeScreenReceiver) }
+        runCatching { unregisterReceiver(runtimeMirrorReceiver) }
+        runCatching { contentResolver.unregisterContentObserver(castStateObserver) }
         ioExecutor.shutdownNow()
         diagnosticsExecutor.shutdownNow()
         super.onDestroy()
@@ -996,8 +1188,15 @@ class ImeSwitchService : Service() {
 
     companion object {
         private const val TAG = "ImeSwitchService"
+        private const val MIRROR_EVENT_NAME = "MIRROR_DEVICE_CHANGED"
+        private const val CAST_STATE_OBSERVER_EVENT_NAME = "CAST_STATE_OBSERVER"
+        private const val CAST_STATE_CHANGED_EVENT_NAME = "CAST_STATE_CHANGED"
         private const val CHANNEL_ID = "ime_switch_channel"
         private const val NOTIFICATION_ID = 1001
+        private const val DERIVED_EVENT_DUPLICATE_SUPPRESSION_WINDOW_MS = 1_500L
+        private const val SHIZUKU_COMMAND_TIMEOUT_MS = 10_000L
+        private const val SHIZUKU_PROCESS_DESTROY_GRACE_MS = 1_000L
+        private const val SHIZUKU_STREAM_READ_GRACE_MS = 1_000L
         private const val START_GBOARD_SERVICE_COMMAND =
             "am startservice -n com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
         private const val CHECK_GBOARD_SERVICE_COMMAND =
@@ -1013,8 +1212,45 @@ class ImeSwitchService : Service() {
         private const val COUNTRY_CACHE_TTL_MS = 7L * 24L * 60L * 60L * 1000L
         private const val PLACEHOLDER_METRIC = "-"
         private const val FCM_PLACEHOLDER_META = "diagnosis=pending"
+        private const val ACTION_MIRROR_DEVICE_CHANGED = "miui.intent.action.MIRROR_DEVICE_CHANGED"
+        private val OBSERVED_CAST_SETTINGS = listOf(
+            ObservedSetting(SettingNamespace.SECURE, "screen_project_in_screening"),
+            ObservedSetting(SettingNamespace.SECURE, "cast_mode"),
+            ObservedSetting(SettingNamespace.SECURE, "screen_project_small_window_on"),
+            ObservedSetting(SettingNamespace.SECURE, "screen_project_hang_up_on"),
+            ObservedSetting(SettingNamespace.SECURE, "synergy_mode"),
+            ObservedSetting(SettingNamespace.SECURE, "mirror_input_state"),
+            ObservedSetting(SettingNamespace.GLOBAL, "mirror_switch"),
+            ObservedSetting(SettingNamespace.GLOBAL, "ucar_casting_state"),
+            ObservedSetting(SettingNamespace.GLOBAL, "VTCAMERA_CAMERA_STATUS"),
+            ObservedSetting(SettingNamespace.GLOBAL, "VTCAMERA_CAMERA_DEVICETYPE")
+        )
 
         const val ACTION_START = "com.example.fcmkeepalive.action.START"
+    }
+
+    private data class DeviceStateSnapshot(
+        val isKeyguardLocked: Boolean,
+        val isDeviceLocked: Boolean,
+        val isInteractive: Boolean
+    )
+
+    private data class ObservedSetting(
+        val namespace: SettingNamespace,
+        val key: String
+    ) {
+        val uri: Uri
+            get() = when (namespace) {
+                SettingNamespace.GLOBAL -> Settings.Global.getUriFor(key)
+                SettingNamespace.SECURE -> Settings.Secure.getUriFor(key)
+                SettingNamespace.SYSTEM -> Settings.System.getUriFor(key)
+            }
+    }
+
+    private enum class SettingNamespace {
+        GLOBAL,
+        SECURE,
+        SYSTEM
     }
 
     private data class DumpsysResult(

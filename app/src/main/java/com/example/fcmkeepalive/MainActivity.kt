@@ -920,9 +920,26 @@ class MainActivity : ComponentActivity() {
                 null,
                 null
             ) as Process
-            val output = process.inputStream?.bufferedReader()?.readText().orEmpty()
-            val error = process.errorStream?.bufferedReader()?.readText().orEmpty()
-            val code = process.waitFor()
+            val result = ShizukuProcessRunner.run(
+                process = process,
+                timeoutMs = SHIZUKU_COMMAND_TIMEOUT_MS,
+                destroyGraceMs = SHIZUKU_PROCESS_DESTROY_GRACE_MS,
+                streamReadGraceMs = SHIZUKU_STREAM_READ_GRACE_MS
+            )
+            if (result.timedOut) {
+                val reason = buildShizukuTimeoutReason()
+                AppLogger.w(
+                    this,
+                    "MainActivity",
+                    "shizuku_cmd",
+                    "Command timeout",
+                    "command=$command, timeoutMs=$SHIZUKU_COMMAND_TIMEOUT_MS"
+                )
+                return CommandResult(success = false, output = "", error = reason)
+            }
+            val output = result.stdout
+            val error = result.stderr
+            val code = result.exitCode ?: -1
             val success = code == 0
             if (!success) {
                 val reason = error.ifBlank { "exit code $code" }
@@ -976,10 +993,28 @@ class MainActivity : ComponentActivity() {
                 null,
                 null
             ) as Process
+            val result = ShizukuProcessRunner.run(
+                process = process,
+                timeoutMs = SHIZUKU_COMMAND_TIMEOUT_MS,
+                destroyGraceMs = SHIZUKU_PROCESS_DESTROY_GRACE_MS,
+                streamReadGraceMs = SHIZUKU_STREAM_READ_GRACE_MS
+            )
+            if (result.timedOut) {
+                val reason = buildShizukuTimeoutReason()
+                showSnackbarMessage("Grant failed: $reason")
+                AppLogger.w(
+                    this,
+                    "MainActivity",
+                    "SHIZUKU_GRANT",
+                    "Grant timeout",
+                    "command=$cmd, timeoutMs=$SHIZUKU_COMMAND_TIMEOUT_MS"
+                )
+                return
+            }
 
-            val output = process.inputStream?.bufferedReader()?.readText().orEmpty()
-            val error = process.errorStream?.bufferedReader()?.readText().orEmpty()
-            val code = process.waitFor()
+            val output = result.stdout
+            val error = result.stderr
+            val code = result.exitCode ?: -1
 
             if (code == 0) {
                 showSnackbarMessage("WRITE_SECURE_SETTINGS granted successfully")
@@ -995,6 +1030,10 @@ class MainActivity : ComponentActivity() {
         } finally {
             refreshGrantButtonVisibility()
         }
+    }
+
+    private fun buildShizukuTimeoutReason(): String {
+        return "Command timeout after ${SHIZUKU_COMMAND_TIMEOUT_MS}ms"
     }
 
     private fun showImeSelector() {
@@ -1046,6 +1085,9 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val SHIZUKU_REQUEST_CODE = 1001
+        private const val SHIZUKU_COMMAND_TIMEOUT_MS = 10_000L
+        private const val SHIZUKU_PROCESS_DESTROY_GRACE_MS = 1_000L
+        private const val SHIZUKU_STREAM_READ_GRACE_MS = 1_000L
         private val PACKAGE_NAME_REGEX = Regex("^[a-zA-Z0-9_]+(\\.[a-zA-Z0-9_]+)+$")
         private val PACKAGE_NAME_IN_TEXT_REGEX = Regex("\\b[a-zA-Z0-9_]+(?:\\.[a-zA-Z0-9_]+)+\\b")
         private val EXCLUDED_FCM_PACKAGES = setOf("com.android.vending")
